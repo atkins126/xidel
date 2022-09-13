@@ -4,6 +4,8 @@
 rm /tmp/xidel-tests-state-ok
 rm /tmp/xidel-tests-state-failed
 
+
+
 tests/test.sh t1   tests/a.xml
 tests/test.sh te   tests/a.xml -e //title 
 tests/test.sh te   -e //title tests/a.xml 
@@ -45,8 +47,8 @@ tests/test.sh sibling2  '<a>123</a>' '<a>456</a>' -e '<a>{$x}</a>'
 tests/test.sh sibling2  -e '<a>{$x}</a>' '<a>123</a>' '<a>456</a>' 
 tests/test.sh sibling2b '<a>123</a>' -e '<a>{$x}</a>' '<a>456</a>' 
 tests/test.sh sibling3a '<t>1</t>' -e 'concat(/t, "b")' '<t>2</t>' -e 'concat(/t, "c")'
-tests/test.sh sibling3b -e 'concat(/t, "a")' '<t>1</t>' -e 'concat(/t, "b")' '<t>2</t>' #extract applied to previous data (think that is good, right?)
-tests/test.sh sibling3c -e 'concat(/t, "a")' '<t>1</t>' -e 'concat(/t, "b")' '<t>2</t>' -e 'concat(/t, "c")' 
+ echo '<x/>' | tests/test.sh sibling3b -e 'concat(/t, "a")' '<t>1</t>' -e 'concat(/t, "b")' '<t>2</t>' #extract applied to previous data (think that is good, right?)
+ echo '<x/>' | tests/test.sh sibling3c -e 'concat(/t, "a")' '<t>1</t>' -e 'concat(/t, "b")' '<t>2</t>' -e 'concat(/t, "c")' 
 tests/test.sh sibling4 tests/a.xml  -f //a     -e //title   tests/dpre.xml -f //a     -e //title  
 
 tests/test.sh tfe  tests/a.xml -f //a     -e //title
@@ -70,7 +72,7 @@ tests/test.sh varmix '<a>hello</a>' -e '.'  -e '<a>{temp:=.}</a>' -e '3+4' -e 'r
 tests/test.sh varmixb '<a>hello</a>' -e 'concat(">", ., "<")'  -e '<a>{temp:=$result}</a>' -e '3+4' -e 'res:=$result'
 tests/test.sh varenviron --variable environ1 -e '$environ1'
 tests/test.sh varenviron2 --variable environ1,environ2 -e '$environ1||$environ2'
-tests/test.sh varenviron2 -e 'declare variable $environ1 external; declare variable $environ2 external; $environ1||$environ2'
+a=123 b=false tests/test.sh varenviron3 -e 'declare variable $a as xs:integer external; declare variable $b as xs:boolean external; join(($a, $b))'
 tests/test.sh varnoenviron --variable foo=bar -e '$foo'
 
 #stdin
@@ -265,6 +267,22 @@ tests/test.sh separator-html --output-format html --output-separator x -e '(1,2)
 tests/test.sh separator-xml2 --output-format xml --output-separator '<br>' --output-header '<div>' --output-footer '</div>' -e '(1,2)' -e 5 -e '""' -e v:=18 -e 0 
 tests/test.sh separator-html2 --output-format html --output-separator '<br>' --output-header '<div>' --output-footer '</div>' -e '(1,2)' -e 5 -e '""' -e v:=18 -e 0 
 
+
+tests/test.sh linebreaksXMLElementNodes-NoDecl-Indent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-node-format=xml --output-node-indent
+tests/test.sh linebreaksXMLElementNodes-Decl-Indent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-node-format=xml --output-node-indent --output-declaration='<?xml?>'
+tests/test.sh linebreaksXMLElementNodes-NoDecl-NoIndent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-node-format=xml 
+tests/test.sh linebreaksXMLElementNodes-Decl-NoIndent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-node-format=xml --output-declaration='<?xml?>'
+
+tests/test.sh linebreaksXMLOutput-ElementNodes-NoDecl-Indent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-format=xml --output-node-indent
+tests/test.sh linebreaksXMLOutput-ElementNodes-Decl-Indent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-format=xml --output-node-indent --output-declaration='<?xml?>'
+tests/test.sh linebreaksXMLOutput-ElementNodes-NoDecl-NoIndent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-format=xml 
+tests/test.sh linebreaksXMLOutput-ElementNodes-Decl-NoIndent -e 'element nodes {(1 to 3) ! element node {attribute id {.},"value"||.}}' --output-format=xml --output-declaration='<?xml?>'
+
+tests/test.sh linebreaksXMLOutput-input-newline-NoDecl-NoIndent tests/input-newline.xml -e . --xml
+
+tests/test.sh linebreaksHTMLOutput-NoDecl-Indent -e '(<html><head><script/><link/></head><body><a/><table><tr><td>a</td><td>b</td></tr></table></body></html>)' --html --output-node-indent
+
+
 tests/test.sh adhoc10  '<x><a>1</a><a>2</a><a>3</a></x>' -e '<a>{.}</a>+' -e '<a>{.}</a>' -e 7
 tests/test.sh xml10  --output-format xml-wrapped  '<x><a>1</a><a>2</a><a>3</a></x>' -e '<a>{.}</a>+' -e '<a>{.}</a>' -e 7
 tests/test.sh json10 --output-format json-wrapped '<x><a>1</a><a>2</a><a>3</a></x>' -e '<a>{.}</a>+' -e '<a>{.}</a>' -e 7
@@ -304,32 +322,34 @@ tests/test.sh bash-combining3 -e 1 -e '(2,3)' -e 'temp:=712' -e '4' -e 'temp:=18
 tests/test.sh jsonmode/standard --json-mode standard --json-mode standard --xquery 'let $x := <a><b>c</b></a>//b, $o := map {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(2))) )'
 tests/test.sh jsonmode/jsoniq --json-mode jsoniq  --xquery 'let $x := <a><b>c</b></a>//b, $o := {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(1))) )' 
 tests/test.sh jsonmode/deprecated  --json-mode deprecated --xquery 'let $x := <a><b>c</b></a>//b, $o := {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(1))) )'
-tests/test.sh jsonmode/default  --json-mode default --xquery 'let $x := <a><b>c</b></a>//b, $o := {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(1))) )'
+tests/test.sh jsonmode/default  --json-mode unified --xquery 'let $x := <a><b>c</b></a>//b, $o := {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(1))) )'
+tests/test.sh jsonmode/default  --disable-no-extended-json --xquery 'let $x := <a><b>c</b></a>//b, $o := map {"a": (), "b": $x, "c": (1,2)}, $a := [(),$x,1 to 3] return (count($o?a), name(root($o?b)), count($o?c), "", array:size($a), string-join((1 to 3)! count($a(.))), name(root($a(1))) )'
 
 tests/test.sh jsonmode/standard-equals - --json-mode standard -e 'for $j in (json($raw), jn:parse-json($raw), parse-json($raw)) return deep-equal($json, $j)' < tests/data2.json
 tests/test.sh jsonmode/jsoniq-equals - --json-mode jsoniq -e 'for $j in (json($raw), jn:parse-json($raw), parse-json($raw)) return deep-equal($json, $j)' < tests/data2.json
 tests/test.sh jsonmode/deprecated-equals - --json-mode deprecated -e 'for $j in (json($raw), jn:parse-json($raw), parse-json($raw)) return deep-equal($json, $j)' < tests/data2.json
-tests/test.sh jsonmode/default-equals - --json-mode default -e 'for $j in (json($raw), jn:parse-json($raw), parse-json($raw)) return deep-equal($json, $j)' < tests/data2.json
+tests/test.sh jsonmode/default-equals - --json-mode unified -e 'for $j in (json($raw), jn:parse-json($raw), parse-json($raw)) return deep-equal($json, $j)' < tests/data2.json
 
 tests/test.sh jsonmode/standard-null - --json-mode standard -e 'count($json(1)), jn:is-null($json(1)), count($json(2)?a), jn:is-null($json?2?a),  count($json(2)?b), jn:is-null($json?2?b)' < tests/data2.json
 tests/test.sh jsonmode/jsoniq-null - --json-mode jsoniq -e 'count($json(1)), jn:is-null($json(1)), count($json(2)?a), jn:is-null($json?2?a),  count($json(2)?b), jn:is-null($json?2?b)' < tests/data2.json
 tests/test.sh jsonmode/deprecated-null - --json-mode deprecated -e 'count($json(1)), jn:is-null($json(1)), count($json(2)?a), jn:is-null($json?2?a),  count($json(2)?b), jn:is-null($json?2?b)' < tests/data2.json
-tests/test.sh jsonmode/default-null - --json-mode default -e 'count($json(1)), jn:is-null($json(1)), count($json(2)?a), jn:is-null($json?2?a),  count($json(2)?b), jn:is-null($json?2?b)' < tests/data2.json
+tests/test.sh jsonmode/default-null - --json-mode unified -e 'count($json(1)), jn:is-null($json(1)), count($json(2)?a), jn:is-null($json?2?a),  count($json(2)?b), jn:is-null($json?2?b)' < tests/data2.json
 
 tests/test.sh jsonmode/standard-boolean - --json-mode standard -e 'if ($json) then "T"[$json and $json(2)][$json][$json(2)] else false()' < tests/data2.json
 tests/test.sh jsonmode/jsoniq-boolean - --json-mode jsoniq -e 'if ($json) then "T"[$json and $json(2)][$json][$json(2)] else false()' < tests/data2.json
 tests/test.sh jsonmode/deprecated-boolean - --json-mode deprecated -e 'if ($json) then "T"[$json and $json(2)][$json][$json(2)] else false()' < tests/data2.json
-tests/test.sh jsonmode/default-boolean - --json-mode default -e 'if ($json) then "T"[$json and $json(2)][$json][$json(2)] else false()' < tests/data2.json
+tests/test.sh jsonmode/default-boolean - --json-mode unified -e 'if ($json) then "T"[$json and $json(2)][$json][$json(2)] else false()' < tests/data2.json
 
 tests/test.sh jsonmode/standard-stringvalue - --json-mode standard -e '$json || $json(2) || join($json(2)) || "x"' < tests/data2.json
 tests/test.sh jsonmode/jsoniq-stringvalue - --json-mode jsoniq -e '$json || $json(2) || join($json(2)) || "x"' < tests/data2.json
 tests/test.sh jsonmode/deprecated-stringvalue - --json-mode deprecated -e '$json || $json(2) || join($json(2)) || "x"' < tests/data2.json
-tests/test.sh jsonmode/default-stringvalue - --json-mode default -e '$json || $json(2) || join($json(2)) || "x"' < tests/data2.json
+tests/test.sh jsonmode/default-stringvalue - --json-mode unified -e '$json || $json(2) || join($json(2)) || "x"' < tests/data2.json
  
 tests/test.sh jsonmode/standard-literals --json-mode standard -e 'true, false, null'
 tests/test.sh jsonmode/jsoniq-literals --json-mode jsoniq -e 'true, false, null'
 tests/test.sh jsonmode/deprecated-literals --json-mode deprecated -e 'true, false, null'
 tests/test.sh jsonmode/default-literals --json-mode default -e 'true, false, null'
+tests/test.sh jsonmode/standard-literals --json-mode default --xquery 'true, false, null'
 tests/test.sh jsonmode/standard-literals --no-json-literals --json-mode jsoniq -e 'true, false, null'
 tests/test.sh jsonmode/standard-literals --no-json-literals --json-mode deprecated -e 'true, false, null'
 tests/test.sh jsonmode/standard-literals --no-json-literals --json-mode default -e 'true, false, null'
@@ -405,9 +425,10 @@ tests/test.sh css '<a>hallo<b>cc</b></a>' --css b
 tests/test.sh xpath1 '<a>hallo<b>cc</b></a>' --xpath b
 tests/test.sh xpath2 '<a>hallo<b>cc</b></a>' --xpath //b
 tests/test.sh xpath3 --xpath "'&gt;'"
-tests/test.sh xpath3 -e "'&gt;'"
+tests/test.sh xpath3x -e "'&gt'"
+tests/test.sh xquery -e "'&gt;'"
 tests/test.sh xquery --xquery "'&gt;'"
-tests/test.sh xquerypath --xquery "'&gt;'" -e "'&gt;'"
+tests/test.sh xquerypath --xquery "'&gt;'" -e "'&gt;'" --xpath "'&gt;'"
 
 tests/test.sh xpath4 '<html>1<a class="foobar">2</a>3</html>' -e 'html'
 tests/test.sh xpath5 '<html>1<a class="foobar">2</a>3</html>' -e 'a'    #make this CSS??
@@ -418,8 +439,8 @@ tests/test.sh css2 '<html>1<a class="foobar">2</a>3</html>' -e '   a.foobar   '
 tests/test.sh xquery4 '<html>1<a class="foobar">2</a>3</html>' -e '   let    $x := //a return $x' #xpath2 now
 tests/test.sh xquery5 '<html>1<a class="foobar">2</a>3</html>' -e '   for tumbling window $x in //a start when true() return "&gt;"'
 tests/test.sh xquery5 '<html>1<a class="foobar">2</a>3</html>' -e '    for sliding window $x in //a start when true() end when true() return "&gt;"'
-tests/test.sh xpath7 '<html>1<a class="foobar">2</a>3</html>' -e '"&gt;"'
-tests/test.sh xpath7 '<html>1<a class="foobar">2</a>3</html>' -e '     "&gt;"'
+tests/test.sh xquery '<html>1<a class="foobar">2</a>3</html>' -e '"&gt;"'
+tests/test.sh xquery '<html>1<a class="foobar">2</a>3</html>' -e '     "&gt;"'
 tests/test.sh template '<html>1<a class="foobar">2</a>3</html>' -e '<a class="foobar">{.}</a>'
 tests/test.sh xquery6 -e '   declare     function local:abc(){"&gt;"}; local:abc()'
 tests/test.sh xquery6 -e '   declare     function local:abc($arg as xs:string){"&gt;"}; local:abc("foo")'
@@ -441,6 +462,8 @@ tests/test.sh system -e 'system("echo 123") * 8'
 #echo 101 | tests/test.sh read -e 'read() * 8' --strict-type-checking
 echo '{"a": 1, "b": 2}' |  tests/test.sh jsonassign - -e '($json).a := 10'
 tests/test.sh jsonreassign -e '$json := [1,2,3]'
+echo '{}' | tests/test.sh jsonmultiassign -e '$json("a") := 12, $json("b") := 34'
+echo '[{"a": 1, "b": 2}]' |  tests/test.sh jsonassignarray - -e '$json?1?c := 10'
 tests/test.sh namespace1 '<c xmlns="foobar">def</c>' -e / --printed-node-format xml
 tests/test.sh namespace2 '<c xmlns="foobar">def</c>' -e / --printed-node-format xml --ignore-namespaces
 tests/test.sh repetitionoff tests/a.xml tests/a.xml -e //title
@@ -498,12 +521,12 @@ tests/test.sh varlogAB -e 'x:clear-log(),a:=1,a:=2,b:=3,c:=4,x:clear-log("c"), t
 
 #interpreter tests
 tests/test.sh utf8  -e 'substring("äbcd",1,3)'
-tests/test.sh division --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a div .), " ")'
-tests/test.sh multiplication --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a * .), " ")'
-tests/test.sh addition --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a + .), " ")'
-tests/test.sh subtraction --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a - .), " ")'
-tests/test.sh divisionInt --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( try { ($a) idiv xs:double(.) } catch *  {$Q{http://www.w3.org/2005/xqt-errors}code} ), " ")'
-tests/test.sh modulo --xquery 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( try { $a mod . } catch *  {$Q{http://www.w3.org/2005/xqt-errors}code} ), " ")'
+tests/test.sh division --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a div .), " ")'
+tests/test.sh multiplication --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a * .), " ")'
+tests/test.sh addition --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a + .), " ")'
+tests/test.sh subtraction --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( $a - .), " ")'
+tests/test.sh divisionInt --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( try { ($a) idiv xs:double(.) } catch *  {$Q{http://www.w3.org/2005/xqt-errors}code} ), " ")'
+tests/test.sh modulo --extract 'let $n := ("-INF", "-1", "-0", "NaN", "0", "1", "INF") for $a in $n return string-join( $n ! ( try { $a mod . } catch *  {$Q{http://www.w3.org/2005/xqt-errors}code} ), " ")'
 
 
 #parser
@@ -612,10 +635,12 @@ tests/test.sh moreActionsLocalPattern  --template-action local --template-file t
 tests/test.sh moreActions -e '"init"||get("res")' --template-action ac1 --template-file tests/more.actions --xquery '"res:" || $res, for $i in ("ac2", "local", "ac1", "ac2") return ( x:call-action($i), "res:"||$res)' #variables set by call-action are reordered before the extract print, since the values of the extract are only known after the for has finished
 tests/test.sh moreActions3  --template-file tests/more.actions  -e 't:=123,x:call-action("local"),x:call-action("foo?"),u:=456,h:=x:has-action("foo"),h:=x:has-action("ac2")'
 
-tests/test.sh eval  --xquery 'let $a := 123 return eval("declare function local:abc(){0};456",{"language": "xquery"})'
-tests/test.sh eval  --xquery 'declare variable $outer := 456; let $a := 123 return eval("declare function local:abc(){0};$outer",{"language": "xquery"})'
+tests/test.sh eval  --xquery 'let $a := 123 return eval("declare function local:abc(){0};456",map {"language": "xquery"})'
+tests/test.sh eval  --xquery 'declare variable $outer := 456; let $a := 123 return eval("declare function local:abc(){0};$outer",map {"language": "xquery"})'
 
 
 echo
 echo Results: 
 wc -l /tmp/xidel-tests-state-ok /tmp/xidel-tests-state-failed 2> /dev/null | grep tests  | sed -Ee 's/([0-9]+).*-([^-]+)/\1 \2/'
+
+if [[ -s /tmp/xidel-tests-state-failed ]] ; then exit 1 ; else exit 0 ; fi 

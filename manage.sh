@@ -2,7 +2,14 @@
 
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-source $DIR/../../../manageUtils.sh
+if [[ -f $DIR/../../../manageUtils.sh ]]; then source $DIR/../../../manageUtils.sh
+else
+  function sfProject(){ echo; }
+  function fileUpload(){ echo; }
+  if [[ $GITHUB_ACTIONS = "true" ]]; then 
+    function zip(){ echo; }
+  fi
+fi
 
 set -e
 
@@ -14,6 +21,7 @@ function getVersion(){
   else VERSION=$MAJOR_VERSION.$MINOR_VERSION.$BUILD_VERSION ; fi
   UPLOAD_PATH="/Xidel/Xidel\ $VERSION/"
   BUILDDATE=`date +%Y%m%d`.`hg log -l 1 | head -1 | sed -e 's/^[^:]*: *//' | tr : .`
+  if [[ $GITHUB_ACTIONS = "true" ]]; then BUILDDATE="$BUILDDATE"git$GITHUB_SHA; fi
   echo "writeln('($BUILDDATE)');" > xidelbuilddata.inc
   ISPRERELEASE=""
   if [[ $BUILD_VERSION = 1 ]] || [[ $BUILD_VERSION = 3 ]] || [[ $BUILD_VERSION = 5 ]] || [[ $BUILD_VERSION = 7 ]] || [[ $BUILD_VERSION = 9 ]]; then 
@@ -30,6 +38,8 @@ action=2
 BASE=$HGROOT/programs/internet/xidel
 exesuffix=
 
+TMP_PACKAGE_DIR=xidelpackage/
+
 function pushhg(){
 	VIDELIBRIBASE=$HGROOT/programs/internet/VideLibri
 	PUBLICHG=$HGROOT/../videlibrixidelpublichg
@@ -40,25 +50,32 @@ function pushhg(){
 function lazcompile(){
   getVersion
   rm xidel$exesuffix || true
-  lazbuild "$@" xidel.lpi || lazbuild "$@" xidel.lpi || (echo "FAILED!"; exit)
+  lazbuild --verbose "$@" xidel.lpi || lazbuild --verbose "$@" xidel.lpi || (echo "FAILED!"; exit)
   echo > xidelbuilddata.inc   
 }
 
 function release(){
   if [ $action -lt 2 ]; then exit; fi
+  rm -rf "$TMP_PACKAGE_DIR"
+  mkdir -p "$TMP_PACKAGE_DIR"
   packagesuffix=$1
-  if [ ! -f meta/cacert.pem ]; then curl https://curl.se/ca/cacert.pem > meta/cacert.pem; fi
+  if [ ! -f meta/cacert.pem ]; then curl https://curl.se/ca/cacert.pem > meta/cacert.pem; chmod -x meta/cacert.pem; fi
   case "$exesuffix" in
     .exe) 
-       package=xidel-$VERSION.$packagesuffix.zip
-       zip -v $package xidel.exe changelog readme.txt 
-       if [ $packagesuffix = "openssl.win32" ]; then
-         cd meta; zip -v ../$package cacert.pem; cd ..
-       fi
+       cp xidel.exe changelog readme.txt $TMP_PACKAGE_DIR
+       if [ $packagesuffix = "openssl.win32" ]; then cp meta/cacert.pem $TMP_PACKAGE_DIR; fi
+       package=$PWD/xidel-$VERSION.$packagesuffix.zip
+       cd $TMP_PACKAGE_DIR
+       zip -v $package *
+       cd -
      ;;
     *) 
+       cp xidel readme.txt changelog install.sh meta/cacert.pem $TMP_PACKAGE_DIR
        package=xidel-$VERSION.$packagesuffix.tar.gz
-       tar -vczf $package xidel readme.txt changelog install.sh -C meta cacert.pem
+       fullpackage=$PWD/$package
+       cd $TMP_PACKAGE_DIR
+       tar -vczf $fullpackage *
+       cd -
      ;;
   esac
   fileUpload $package "$UPLOAD_PATH"
@@ -95,6 +112,11 @@ linuxarm)
         release linuxarm
         ;;
 
+linuxarm64)
+        lazcompile --os=linux --ws=nogui --cpu=aarch64
+        release linuxaarch64
+        ;;
+
 win32)
         exesuffix=.exe
         lazcompile --os=win32 --ws=win32 --cpu=i386 --build-mode=win32
@@ -104,6 +126,11 @@ win32synapse|win32openssl)
         exesuffix=.exe
         lazcompile --os=win32 --ws=win32 --cpu=i386 --build-mode=win32synapse
         release openssl.win32
+        ;;
+win64)
+        exesuffix=.exe
+        lazcompile --os=win64 --ws=win64 --cpu=x86_64 --build-mode=win32
+        release win64
         ;;
 
 androidarm)
@@ -128,12 +155,22 @@ release)
         ./manage.sh linux32
         ./manage.sh linux64        
         ./manage.sh linuxarm
+        ./manage.sh linuxarm64
         ./manage.sh win32
         ./manage.sh win32synapse
+        ./manage.sh win64
         ./manage.sh androidarm
         ./manage.sh androidarm64
         ./manage.sh mirror
         mv oldxidel xidel
+        ;;
+        
+preparepackage)
+        release
+        ;;
+
+preparebuild)
+        getVersion
         ;;
         
 hg)     pushhg
@@ -141,6 +178,10 @@ hg)     pushhg
 
 mirror) 
         pushhg || true
+        set +e
+        (cd $HGROOT/components/pascal; ./manage.internettools.sh mirror; ./manage.synapse.sh mirror;  ./manage.synapse.sh mirror; ./manage.rcmdline.sh mirror;  )
+        echo $PWD
+        echo ???
         SF_PROJECT= 
         mirroredProject xidel
         syncHg $BASE/_hg.filemap
@@ -152,6 +193,7 @@ src)
         SRCDIR=/tmp/xidel-$VERSION-src
         rm -R $SRCDIR || true
         cp -r $PUBLICHG $SRCDIR
+        cp xidelbuilddata.inc $SRCDIR/programs/internet/xidel/
         cd /tmp
         rm -Rvf $SRCDIR/programs/internet/VideLibri $SRCDIR/programs/internet/sourceforgeresponder/
         

@@ -4,7 +4,7 @@ unit xidelcrt;
 
 interface
 
-uses rcmdline, sysutils;
+uses rcmdline, sysutils, simplehtmlparser;
 
 var
   allowFileAccess: boolean = true;
@@ -15,7 +15,7 @@ EXidelException = class(Exception);
 EXidelInvalidArgument = class(EXidelException);
 
 
-TConsoleColors = (ccNormal, ccRedBold, ccGreenBold, ccBlueBold, ccPurpleBold, ccYellowBold, ccCyanBold,
+TConsoleColors = (ccNormal, ccWhiteBold, ccRedBold, ccGreenBold, ccBlueBold, ccPurpleBold, ccYellowBold, ccCyanBold,
                               ccRed, ccGreen, ccBlue, ccPurple, ccYellow
  );
 
@@ -29,11 +29,13 @@ procedure endOutput(mycmdline: TCommandLineReader);
 
 procedure w(const s: string);
 procedure wln(const s: string = '');
-type TColorOptions = (cAuto, cNever, cAlways, cJSON, cXML);
+type TColorOptions = (cAuto, cNever, cAlways, cJSON, cXML, cHTML);
 procedure wcolor(const s: string; color: TColorOptions);
+procedure writeLineBreakAfterDeclaration;
 procedure writeItem(const s: string; color: TColorOptions = cNever);
 procedure writeVarName(const s: string; color: TColorOptions = cNever);
-procedure wstderr(const s: string);
+procedure werr(const s: string);
+procedure werrln(const s: string);
 
 function strReadFromStdin: string;
 
@@ -60,6 +62,10 @@ var
 
   colorizing: TColorOptions;
 
+  firstItem: boolean = true;
+  lastWrittenChar: char = #0;
+  lastWrittenToStderr: boolean = false;
+  implicitLineBreakAfterDeclaration: boolean = false;
 implementation
 uses bbutils
   {$ifdef unix}, termio{$endif}
@@ -77,7 +83,6 @@ var
   stacklen: SizeInt;
   stack: TLongintArray;
 
-  firstItem: boolean = true;
 
 
 
@@ -86,15 +91,15 @@ var
 procedure setTerminalColor(err: boolean; color: TConsoleColors);
 {$ifdef unix}
 const colorCodes: array[TConsoleColors] of string = (
-   #27'[0m', #27'[1;31m', #27'[1;32m', #27'[1;34m', #27'[1;35m', #27'[1;33m', #27'[1;36m',
-             #27'[0;31m', #27'[0;32m', #27'[0;34m', #27'[0;35m', #27'[0;33m'
+   #27'[0m', #27'[1;37m', #27'[1;31m', #27'[1;32m', #27'[1;34m', #27'[1;35m', #27'[1;33m', #27'[1;36m',
+                          #27'[0;31m', #27'[0;32m', #27'[0;34m', #27'[0;35m', #27'[0;33m'
    );
 var
   f: TextFile;
 {$endif}
 {$ifdef windows}
 const colorCodes: array[TConsoleColors] of integer = (
-   FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE,
+   FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE, FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY,
      FOREGROUND_RED or FOREGROUND_INTENSITY, FOREGROUND_GREEN or FOREGROUND_INTENSITY, FOREGROUND_BLUE or FOREGROUND_INTENSITY, FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY, FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY, FOREGROUND_BLUE or FOREGROUND_GREEN or FOREGROUND_INTENSITY,
      FOREGROUND_RED, FOREGROUND_GREEN, FOREGROUND_BLUE, FOREGROUND_RED or FOREGROUND_BLUE, FOREGROUND_RED or FOREGROUND_GREEN
    );
@@ -144,23 +149,18 @@ var
   consoleBuffer: TConsoleScreenBufferInfo;
 {$endif}
 begin
-  outputHeader := mycmdline.readString('output-declaration') + mycmdline.readString('output-header');
-  if (outputHeader <> '') and not mycmdline.existsProperty('output-header') then outputHeader += LineEnding;
   outputSeparator := mycmdline.readString('output-separator');
   outputFooter := mycmdline.readString('output-footer');
   case mycmdLine.readString('output-format') of
     'adhoc': outputFormat:=ofAdhoc;
     'html': begin
       outputFormat:=ofRawHTML;
-      if not mycmdline.existsProperty('output-declaration') then outputHeader:='<!DOCTYPE html>'+LineEnding+outputHeader;
     end;
     'xml': begin
       outputFormat:=ofRawXML;
-      if not mycmdline.existsProperty('output-declaration') then outputHeader:='<?xml version="1.0" encoding="'+ strEncodingName(GetTextCodePage(Output))+'"?>'+LineEnding+outputHeader;
     end;
     'xml-wrapped': begin
       outputFormat:=ofXMLWrapped;
-      if not mycmdline.existsProperty('output-declaration') then outputHeader:='<?xml version="1.0" encoding="'+ strEncodingName(GetTextCodePage(Output))+'"?>'+LineEnding+outputHeader;
     end;
     'json', 'json-wrapped': begin
       outputFormat:=ofJsonWrapped;
@@ -190,6 +190,7 @@ begin
     'always': colorizing := cAlways;
     'json': colorizing := cJSON;
     'xml': colorizing := cXML;
+    'html': colorizing := cHTML;
     else raise EXidelInvalidArgument.Create('Invalid color: '+mycmdline.readString('color'));
   end;
   {$ifdef unix}
@@ -216,14 +217,18 @@ begin
       isStdoutTTY := true;
       isStderrTTY := true;
     end;
+    cAuto, cJSON, cXML, cHTML: ;
   end;
   case colorizing of
     cAuto, cAlways: begin
       case outputFormat of
-        ofXMLWrapped, ofRawHTML, ofRawXML: colorizing := cXML;
+        ofXMLWrapped, ofRawXML: colorizing := cXML;
+        ofRawHTML: colorizing := cHTML;
         ofJsonWrapped: colorizing := cJSON;
+        ofAdhoc, ofBash, ofWindowsCmd: ;
       end;
     end;
+    cNever, cJSON, cXML, cHTML: ;
   end;
   {$ifdef windows}
   if colorizing <> cNever then begin
@@ -238,6 +243,28 @@ begin
     end;
   end;
   {$endif}
+
+end;
+
+procedure writeOutputHeader(mycmdline: TCommandLineReader);
+var
+  outputDeclaration: String;
+begin
+  outputDeclaration := mycmdline.readString('output-declaration');
+  outputHeader :=  mycmdline.readString('output-header');
+  case outputFormat of
+    ofRawHTML:
+      if not mycmdline.existsProperty('output-declaration') then outputDeclaration:='<!DOCTYPE html>';
+    ofRawXML, ofXMLWrapped:
+      if not mycmdline.existsProperty('output-declaration') then outputDeclaration:='<?xml version="1.0" encoding="'+ strEncodingName(GetTextCodePage(xidelOutputFile))+'"?>';
+    ofAdhoc, ofJsonWrapped, ofBash, ofWindowsCmd: ;
+  end;
+  if (outputHeader <> '') and (outputDeclaration <> '') then
+    outputDeclaration += LineEnding
+  else if outputDeclaration <> '' then
+    implicitLineBreakAfterDeclaration := (outputFormat in [ofRawHTML, ofRawXML, ofXMLWrapped]) or (mycmdline.readFlag('output-node-indent'));
+  outputHeader := outputDeclaration + outputHeader;
+  if outputHeader <> '' then wcolor(outputHeader, colorizing);
 end;
 
 procedure setOutputFileName(n: string; mycmdline: TCommandLineReader);
@@ -245,7 +272,7 @@ begin
   if xidelOutputFileName = n then exit;
   if xidelOutputFileName <> '' then begin
     if outputfooter <> '' then wcolor(outputFooter, colorizing)
-    else if not mycmdline.existsProperty('output-footer') and not firstItem then wln();
+    else if not mycmdline.existsProperty('output-footer') and not firstItem and not (lastWrittenChar in [#13,#10]) then wln();
     flush(xidelOutputFile);
     if not striBeginsWith(xidelOutputFileName, 'stdout:') then CloseFile(xidelOutputFile);
   end;
@@ -268,7 +295,7 @@ begin
 
   if n = '' then exit;
 
-  if outputHeader <> '' then wcolor(outputHeader, colorizing);
+  writeOutputHeader(mycmdline);
   if outputFormat in [ofJsonWrapped, ofXMLWrapped] then needRawWrapper(mycmdline);
 end;
 
@@ -276,8 +303,11 @@ var hasRawWrapper: boolean = false;
 procedure needRawWrapper(mycmdline: TCommandLineReader);
   procedure setHeaderFooter(const h, f: string);
   begin
-    if outputFormat = ofJsonWrapped then wcolor(h, cJSON)
-    else wcolor(h, cXML);
+    case outputFormat of
+      ofJsonWrapped: wcolor(h, cJSON);
+      ofRawHTML: wcolor(h, cHTML);
+      else wcolor(h, cXML);
+    end;
     if outputSeparator = LineEnding then wln();
     if not mycmdline.existsProperty('output-footer') then outputFooter := f + LineEnding;
   end;
@@ -287,6 +317,7 @@ var
 begin
   if hasRawWrapper then exit;
   hasRawWrapper := true;
+  writeLineBreakAfterDeclaration;
   if not mycmdline.existsProperty('output-header') then begin
     if not mycmdline.existsProperty('output-separator') then le := LineEnding
     else le := '';
@@ -295,6 +326,7 @@ begin
       ofRawXML: setHeaderFooter('<xml>', le + '</xml>');
       ofJsonWrapped: setHeaderFooter('[', le + ']');
       ofXMLWrapped: setHeaderFooter('<seq>', '</seq>');
+      ofAdhoc, ofBash, ofWindowsCmd: ;
     end;
   end;
 end;
@@ -343,6 +375,111 @@ begin
 end;
 
 
+type TMLHighlighter = class
+  data: string;
+  marker: pchar;
+  //print string s highlighed as XML or HTML
+  procedure writeHighlighted(const s: string; mode: TColorOptions);
+  //internally used to print a word some color
+  procedure writeHighlighted(start: pchar; len: SizeInt; color: TConsoleColors);
+  function enterTag(tagName: pchar; tagNameLen: SizeInt; properties: THTMLProperties):TParsingResult;
+  function leaveTag(tagName: pchar; tagNameLen: SizeInt):TParsingResult;
+  function commentNode(comment: pchar; commentLen: SizeInt):TParsingResult;
+  procedure docType(name: pchar; nameLen: SizeInt; more: pchar; moreLen: SizeInt);
+  function textNode(text: pchar; textLen: SizeInt; {%H-}textFlags: TTextFlags):TParsingResult;
+  function processingInstruction(text: pchar; textLen: SizeInt; {%H-}textFlags: TTextFlags):TParsingResult;
+end;
+var globalMLHighlighter: TMLHighlighter;
+
+const
+  XML_COLOR_COMMENT: TConsoleColors = ccBlue;
+  XML_COLOR_TAG: TConsoleColors = ccYellowBold;
+  XML_COLOR_ATTRIB_NAME: TConsoleColors = ccPurpleBold;
+  XML_COLOR_ATTRIB_VALUE: TConsoleColors = ccGreenBold;
+
+procedure writeColorReset;
+begin
+  if not isStdoutTTY then exit;
+  lastConsoleColor := ccYellow;
+  setTerminalColor(false, ccNormal);
+end;
+
+procedure TMLHighlighter.writeHighlighted(const s: string; mode: TColorOptions);
+var options: TParsingOptions;
+begin
+  if s = '' then exit;
+  writeColorReset;
+  data := s;
+  marker := @data[1];
+  if mode = cHTML then options := [poRespectHTMLCDATAElements,poRespectHTMLProcessingInstructions]
+  else options := [poRespectXMLProcessingInstructions];
+  parseML(data, options, @enterTag, @leaveTag, @textNode, @commentNode, @processingInstruction, @docType);
+  writeHighlighted(@data[1] + length(data), 0, ccNormal);
+end;
+
+procedure TMLHighlighter.writeHighlighted(start: pchar; len: SizeInt; color: TConsoleColors);
+var
+  overlap: sizeint;
+begin
+  if marker < start then begin
+    setTerminalColor(false, ccNormal);
+    w(strFromPchar(marker, start - marker));
+    marker := start;
+  end else if marker >= start then begin
+    overlap := marker - start;
+    len := len - overlap;
+    start := start + overlap;
+  end;
+  if len > 0 then begin
+    setTerminalColor(false, color);
+    w(strFromPchar(start, len));
+    marker := start + len;
+  end;
+end;
+
+function TMLHighlighter.enterTag(tagName: pchar; tagNameLen: SizeInt; properties: THTMLProperties): TParsingResult;
+var
+  i: sizeint;
+begin
+  result := prContinue;
+  writeHighlighted(tagName, tagNameLen, XML_COLOR_TAG);
+  for i := 0 to high(properties) do begin
+    writeHighlighted(properties[i].name, properties[i].nameLen, XML_COLOR_ATTRIB_NAME);
+    writeHighlighted(properties[i].value, properties[i].valueLen, XML_COLOR_ATTRIB_VALUE);
+  end;
+end;
+function TMLHighlighter.leaveTag(tagName: pchar; tagNameLen: SizeInt): TParsingResult;
+begin
+  result := prContinue;
+  writeHighlighted(tagName, tagNameLen, XML_COLOR_TAG);
+end;
+function TMLHighlighter.commentNode(comment: pchar; commentLen: SizeInt): TParsingResult;
+begin
+  result := prContinue;
+  writeHighlighted(comment, commentLen, XML_COLOR_COMMENT);
+end;
+procedure TMLHighlighter.docType(name: pchar; nameLen: SizeInt; more: pchar; moreLen: SizeInt);
+begin
+  ignore(pointer(more));
+  ignore(moreLen);
+  writeHighlighted(name, nameLen, XML_COLOR_ATTRIB_NAME);
+end;
+function TMLHighlighter.textNode(text: pchar; textLen: SizeInt; textFlags: TTextFlags): TParsingResult;
+begin
+  ignore(pointer(text));
+  ignore(textLen);
+  result := prContinue;
+end;
+function TMLHighlighter.processingInstruction(text: pchar; textLen: SizeInt; textFlags: TTextFlags): TParsingResult;
+var
+  nameEnd: sizeint;
+begin
+  result := prContinue;
+  nameEnd := 0;
+  while (nameEnd < textLen) and not (text[nameEnd] in WHITE_SPACE) do inc(nameEnd);
+  writeHighlighted(text, nameEnd, XML_COLOR_TAG);
+  writeHighlighted(text + nameEnd, textLen - nameEnd, XML_COLOR_ATTRIB_VALUE);
+end;
 
 
 procedure wcolor(const s: string; color: TColorOptions);
@@ -359,10 +496,6 @@ const JSON_COLOR_OBJECT_PAREN: TConsoleColors = ccYellowBold;
   JSON_STATE_OBJECTVALUE = 2;
   JSON_STATE_OBJECTKEY = 3;
 
-  XML_COLOR_COMMENT: TConsoleColors = ccBlue;
-  XML_COLOR_TAG: TConsoleColors = ccYellowBold;
-  XML_COLOR_ATTRIB_NAME: TConsoleColors = ccPurpleBold;
-  XML_COLOR_ATTRIB_VALUE: TConsoleColors = ccGreenBold;
 
 
 var pos, lastpos: integer;
@@ -374,8 +507,6 @@ setTerminalColor(false, c);
 lastpos:=pos;
 end;
 
-var    quote: Char;
-scriptSpecialCase: Boolean;
 begin
 case color of
 cJSON: begin
@@ -428,87 +559,47 @@ cJSON: begin
   end;
   colorChange(ccNormal)
 end;
-cXML: begin
-  pos := 1;
-  lastpos := 1;
-  scriptSpecialCase := false;
-  while pos <= length(s) do begin
-    case s[pos] of
-      '<': if scriptSpecialCase and not striBeginsWith(@s[pos], '</script') then inc(pos)
-      else begin
-        colorChange(XML_COLOR_TAG);
-        if (pos + 1) <= length(s) then begin
-          case s[pos+1] of
-            '/', '?': inc(pos,2);
-            '!': if strBeginsWith(@s[pos], '<!--') then begin
-              colorChange(XML_COLOR_COMMENT);
-              inc(pos,3);
-              while (pos + 3 <= length(s)) and ((s[pos] <> '-') or (s[pos+1] <> '-')or (s[pos+2] <> '>')) do inc(pos);
-              inc(pos);
-              continue;
-            end;
-          end;
-        end;
-        scriptSpecialCase := striBeginsWith(@s[pos], '<script');
-        while (pos <= length(s)) and not (s[pos] in ['>','/','?',#0..#32]) do inc(pos);
-        while (pos <= length(s)) do begin
-          case s[pos] of
-            '>','/','?': begin
-              colorChange(XML_COLOR_TAG);
-              if s[pos] <> '>' then inc(pos);
-              break;
-            end;
-             #0..#32: ;
-             else begin
-               colorChange(XML_COLOR_ATTRIB_NAME);
-               while (pos <= length(s)) and not (s[pos] in ['=','/','>']) do inc(pos);
-               colorChange(XML_COLOR_TAG);
-               if s[pos] <> '=' then break;
-               inc(pos);
-               while (pos <= length(s)) and (s[pos] in [#0..#32]) do inc(pos);
-               colorChange(XML_COLOR_ATTRIB_VALUE);
-               if (pos <= length(s)) then
-                 case s[pos] of
-                   '''', '"': begin
-                     quote := s[pos];
-                     inc(pos);
-                     while (pos <= length(s)) and (s[pos] <> quote) do inc(pos);
-                     inc(pos);
-                   end;
-                   else while (pos <= length(s)) and not (s[pos] in [#0..#32]) do inc(pos);
-                 end;
-               continue;
-             end;
-          end;
-          inc(pos);
-        end;
-        inc(pos);
-        colorChange(ccNormal);
-      end;
-      else inc(pos);
-    end;
-  end;
-  colorChange(ccNormal)
+cXML,cHTML: begin
+  if globalMLHighlighter = nil then globalMLHighlighter := TMLHighlighter.Create;
+  globalMLHighlighter.writeHighlighted(s, color);
 end;
 else w(s);
 end;
 end;
 
-procedure wstderr(const s: string);
+procedure werr(const s: string);
 begin
-  if not firstItem then writeln(stderr);
-  writeln(stderr, s);
+  if not lastWrittenToStderr and not firstItem then writeln(stderr);
+  write(stderr, s);
+  lastWrittenToStderr := true;
+end;
+
+procedure werrln(const s: string);
+begin
+  werr(s);
+  werr(LineEnding);
 end;
 
 
+
+procedure writeLineBreakAfterDeclaration;
+begin
+  if implicitLineBreakAfterDeclaration then begin
+    wln();
+    lastWrittenChar := #10;
+    implicitLineBreakAfterDeclaration := false;
+  end;
+end;
 
 procedure writeItem(const s: string; color: TColorOptions = cNever);
 begin
   if not firstItem then begin
     w(outputSeparator);
-  end;
+  end else if (outputHeader <> '') and (outputSeparator = LineEnding) and (s <> '') and not (s[1] in [#13,#10]) then writeLineBreakAfterDeclaration;
   wcolor(s, color);
   firstItem := false;
+  lastWrittenToStderr := false;
+  if s <> '' then lastWrittenChar := s[length(s)];
 end;
 
 procedure writeVarName(const s: string; color: TColorOptions = cNever);
@@ -516,6 +607,7 @@ begin
   writeItem(s, color);
   firstItem := true; //prevent another line break / separator
 end;
+
 
 type
   FileFunc = Procedure(var t : TextRec);
@@ -557,6 +649,8 @@ begin
   sb.final;
 end;
 
+finalization
+  if globalMLHighlighter <> nil then globalMLHighlighter.free
 
 end.
 

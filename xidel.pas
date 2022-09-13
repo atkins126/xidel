@@ -30,7 +30,7 @@ program xidel;
 {$endif}
 
 uses //heaptrc,
-     internetaccess, multipagetemplate, bbutils,
+     internetaccess, bbutils,
      xidelbase,
      rcmdline, //<< if you don't have this command line parser unit, you can download it from www.benibela.de
      xquery_module_file
@@ -42,18 +42,6 @@ uses //heaptrc,
  { TTemplateReaderBreaker }
 
 
-function prepareInternet(const userAgent, proxy: string; onReact: TTransferReactEvent): TInternetAccess;
-begin
-  defaultInternetConfiguration.userAgent:=userAgent;
-  defaultInternetConfiguration.setProxy(proxy);
-  if assigned(internetaccess.defaultInternet.internetConfig) then begin
-    internetaccess.defaultInternet.internetConfig^.userAgent := userAgent;
-    internetaccess.defaultInternet.internetConfig^.setProxy(proxy);
-  end;
-  result := internetaccess.defaultInternet;
-  defaultInternetAccessClass := TInternetAccessClass( result.ClassType);
-  result.OnTransferReact := onReact;
-end;
 
 function retrieve(const method, url, post, headers: string): string;
 var
@@ -90,7 +78,6 @@ begin
   xidelbase.cgimode := false;
   xidelbase.allowInternetAccess := true;
   xidelbase.mycmdline := TCommandLineReader.create;
-  xidelbase.onPrepareInternet := @prepareInternet;
   xidelbase.onRetrieve := @retrieve;
 
 

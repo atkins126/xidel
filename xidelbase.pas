@@ -25,6 +25,8 @@ unit xidelbase;
 {$modeswitch typehelpers}
 {$COperators on}{$goto on}{$inline on}
 
+//{$define FREE_ALL_MEMORY_ON_EXIT}
+
 interface
 
 uses
@@ -35,6 +37,7 @@ uses
   //xquery_module_binary,
   xquery_module_math,
   xquery_module_uca_icu,
+  internetaccess_inflater_paszlib,
   rcmdline,math
   ;
 
@@ -52,7 +55,6 @@ var cgimode: boolean = false;
 
 var
     onPostParseCmdLine: procedure ();
-    onPrepareInternet: function (const useragent, proxy: string; onReact: TTransferReactEvent): tinternetaccess;
     onRetrieve: function (const method, url, postdata, headers: string): string;
     onPreOutput: procedure (extractionKind: TExtractionKind);
 
@@ -61,8 +63,8 @@ procedure perform;
 
 implementation
 
-uses process, strutils, bigdecimalmath, xquery_json, xquery__regex, xquery_utf8, xquery.internals.common, xquery.namespaces, xidelcrt,
-  xquery__serialization, xquery__serialization_nodes;
+uses process, strutils, bigdecimalmath, xquery_json, xquery__regex, xquery.internals.common, xquery.namespaces, xidelcrt,
+  xquery__serialization, xquery__serialization_nodes, fastjsonreader;
 //{$R xidelbase.res}
 
 
@@ -161,8 +163,11 @@ end;
 
 /////////////////////////////////////////////////////
 
-var
-    internet: TInternetAccess;
+function internet: TInternetAccess;
+begin
+  if not allowInternetAccess then raise EXidelException.Create('Internet access not permitted');
+  result := defaultInternet;
+end;
 
 type TInputFormat = (ifAuto, ifXML, ifHTML, ifXMLStrict, ifJSON, ifJSONStrict, ifPlainText);
 
@@ -175,7 +180,7 @@ function rawData: string;
 function baseUri: string;
 function displayBaseUri: string;
 function contenttype: string;
-function headers: TStringList;
+function headers: THTTPHeaderList;
 function recursionLevel: integer;
 function inputFormat: TInputFormat;
 end;
@@ -292,26 +297,28 @@ end;
 
 
 type
+  trilean = (tUnknown, tTrue, tFalse);
 
   { TOptionReaderWrapper }
 
   TOptionReaderWrapper = class
-    function read(const name: string; out value: string): boolean; virtual; abstract;
-    function read(const name: string; out value: integer): boolean; virtual; abstract;
-    function read(const name: string; out value: boolean): boolean; virtual; abstract;
-    function read(const name: string; out value: Extended): boolean; virtual; abstract;
-    function read(const name: string; out value: IXQValue): boolean; virtual;
-    function read(const name: string; out inputformat: TInputFormat): boolean; virtual;
+    function read(const name: string; var value: string): boolean; virtual; abstract; //must be out since it is used to clear some values in --follow requests
+    function read(const name: string; var value: integer): boolean; virtual; abstract;
+    function read(const name: string; var value: boolean): boolean; virtual; abstract;
+    function read(const name: string; var value: Extended): boolean; virtual; abstract;
+    function read(const name: string; var value: IXQValue): boolean; virtual;
+    function read(const name: string; var inputformat: TInputFormat): boolean; virtual;
+    function read(const name: string; var value: trilean): boolean; virtual;
   end;
 
   { TOptionReaderFromCommandLine }
 
   TOptionReaderFromCommandLine = class(TOptionReaderWrapper)
     constructor create(cmdLine: TCommandLineReader);
-    function read(const name: string; out value: string): boolean; override;
-    function read(const name: string; out value: integer): boolean; override;
-    function read(const name: string; out value: boolean): boolean; override;
-    function read(const name: string; out value: Extended): boolean; override;
+    function read(const name: string; var value: string): boolean; override;
+    function read(const name: string; var value: integer): boolean; override;
+    function read(const name: string; var value: boolean): boolean; override;
+    function read(const name: string; var value: Extended): boolean; override;
   private
     acmdLine: TCommandLineReader;
   end;
@@ -320,11 +327,11 @@ type
 
   TOptionReaderFromObject = class(TOptionReaderWrapper)
     constructor create(aobj: TXQValueMapLike);
-    function read(const name: string; out value: string): boolean; override;
-    function read(const name: string; out value: integer): boolean; override;
-    function read(const name: string; out value: boolean): boolean; override;
-    function read(const name: string; out value: Extended): boolean; override;
-    function read(const name: string; out value: IXQValue): boolean; override;
+    function read(const name: string; var value: string): boolean; override;
+    function read(const name: string; var value: integer): boolean; override;
+    function read(const name: string; var value: boolean): boolean; override;
+    function read(const name: string; var value: Extended): boolean; override;
+    function read(const name: string; var value: IXQValue): boolean; override;
   private
     obj: TXQValueMapLike;
   end;
@@ -346,13 +353,13 @@ private
   fcontenttype: string;
   frecursionLevel: integer;
   finputformat: TInputFormat;
-  fheaders: TStringList;
+  fheaders: THTTPHeaderList;
 public
   function rawData: string;
   function baseUri: string;
   function displayBaseUri: string;
   function contentType: string;
-  function headers: TStringList;
+  function headers: THTTPHeaderList;
   function recursionLevel: integer;
   function inputFormat: TInputFormat;
   constructor create(somedata: string; aurl: string; acontenttype: string = '');
@@ -511,7 +518,8 @@ TExtraction = class(TDataProcessing)
  printTypeAnnotations,  hideVariableNames: boolean;
  printedNodeFormat: TTreeNodeSerialization;
  printedJSONFormat: (jisDefault, jisPretty, jisCompact);
- inplaceOverride: boolean;
+ printedJSONKeyOrder: TXQKeyOrder;
+ outputIndentXML, inplaceOverride: boolean;
 
  inputFormat: TInputFormat;
 
@@ -520,6 +528,7 @@ TExtraction = class(TDataProcessing)
  procedure readOptions(reader: TOptionReaderWrapper); override;
 
  procedure setVariables(v: string);
+
 
  procedure printExtractedValue(value: IXQValue; invariable: boolean);
  procedure printCmdlineVariable(const name: string; const value: IXQValue);
@@ -549,6 +558,17 @@ TFollowToWrapper = class(TDataProcessing)
 end;
 
 { TProcessingContext }
+TXQueryCompatibilityOptions = record
+  JSONMode: (cjmUndefined, cjmUnified, cjmStandard, cjmJSONiq, cjmDeprecated);
+  noExtendedStrings, noJSON, noJSONliterals, onlyJSONObjects, noExtendedJson, strictTypeChecking, strictNamespaces: trilean;
+  dotNotation: TXQPropertyDotNotation;
+  ignoreNamespace: boolean;
+  procedure setUnknownToDefault(kind: TExtractionKind);
+  procedure configureParsers;
+  procedure configureParsers(kind: TExtractionKind);
+end;
+
+TStatusInfo = (sDefault, sProcessingInformation);
 
 //Processing is done in processing contexts
 //A processing context can have its own data sources (TFollowTo or data sources of a nested processing context) or receive the data from its parent
@@ -573,21 +593,21 @@ TProcessingContext = class(TDataProcessing)
   wait: Extended;
   userAgent: string;
   proxy: string;
+  hasProxySettings: boolean;
   printReceivedHeaders: boolean;
   errorHandling: string;
   loadCookies, saveCookies: string;
 
   silent, printPostData: boolean;
 
-  ignoreNamespace: boolean;
-  compatibilityJSONMode: (cjmDefault, cjmStandard, cjmJSONiq, cjmDeprecated);
-  compatibilityNoExtendedStrings,compatibilityNoJSON, compatibilityNoJSONliterals, compatibilityOnlyJSONObjects, compatibilityNoExtendedJson, compatibilityStrictTypeChecking, compatibilityStrictNamespaces: boolean;
-  compatibilityDotNotation: TXQPropertyDotNotation;
+  compatibility: TXQueryCompatibilityOptions;
   noOptimizations: boolean;
 
   yieldDataToParent: boolean;
 
-  procedure printStatus(s: string);
+  procedure configureInternet;
+
+  procedure printStatus(header, status: string; statusInfo: TStatusInfo);
 
   procedure readOptions(reader: TOptionReaderWrapper); override;
   procedure mergeWithObject(obj: TXQValueMapLike); override;
@@ -604,7 +624,7 @@ TProcessingContext = class(TDataProcessing)
 
   function last: TProcessingContext; //returns the last context in this sibling/follow chain
 
-  procedure insertFictiveDatasourceIfNeeded(canUseStdin: boolean); //if no data source is given in an expression (or an subexpression), but an aciton is there, <empty/> is added as data source
+  procedure insertFictiveDatasourceIfNeeded(canUseStdin: boolean; options: TOptionReaderWrapper); //if no data source is given in an expression (or an subexpression), but an aciton is there, <empty/> is added as data source
 
   function process(data: IData): TFollowToList; override;
 
@@ -617,13 +637,120 @@ private
   procedure loadDataForQueryPreParse(const data: IData);
   procedure loadDataForQuery(const data: IData; const query: IXQuery);
   function evaluateQuery(const query: IXQuery; const data: IData; const allowWithoutReturnValue: boolean = false): IXQValue;
-  procedure httpReact (sender: TInternetAccess; var {%H-}method: string; var {%H-}url: TDecodedUrl; var {%H-}data:TInternetAccessDataBlock; var reaction: TInternetAccessReaction);
+  procedure httpReact (sender: TInternetAccess; var {%H-}transfer: TTransfer; var reaction: TInternetAccessReaction);
 end;
 
 var globalCurrentExtraction: TExtraction;
 
 
 type EInvalidArgument = Exception;
+
+var GlobalJSONParseOptions: TJSONParserOptions = [];
+procedure setJSONFormat(format: TInputFormat);
+begin
+  case format of //todo: cache?
+    ifJSON: xpathparser.DefaultJSONParser.options := [jpoAllowMultipleTopLevelItems, jpoLiberal, jpoAllowTrailingComma] + GlobalJSONParseOptions;
+    ifJSONStrict: xpathparser.DefaultJSONParser.options := [] + GlobalJSONParseOptions;
+    else;
+  end;
+end;
+
+procedure TXQueryCompatibilityOptions.setUnknownToDefault(kind: TExtractionKind);
+begin
+  if noJSON = tUnknown then noJSON := tFalse;
+  case kind of
+    ekPatternXML, ekPatternHTML, ekMultipage, ekDefault: begin
+      if JSONMode = cjmUndefined then JSONMode := cjmUnified;
+      if noExtendedStrings = tUnknown then noExtendedStrings := tFalse;
+      if noJSONliterals = tUnknown then begin
+        if JSONMode = cjmStandard then noJSONliterals := ttrue
+        else noJSONliterals:=tFalse;
+      end;
+      if onlyJSONObjects = tUnknown then onlyJSONObjects := tFalse;
+      if noExtendedJson = tUnknown then
+        if JSONMode in [cjmStandard,cjmJSONiq] then noExtendedJson := tTrue
+        else noExtendedJson := tFalse;
+      if strictTypeChecking = tUnknown then strictTypeChecking := tFalse;
+      if strictNamespaces = tUnknown then strictNamespaces := tFalse;
+      if dotNotation = xqpdnUndefined then dotNotation := xqpdnAllowUnambiguousDotNotation;
+    end;
+    else begin
+      if JSONMode = cjmUndefined then JSONMode := cjmStandard;
+      if noExtendedStrings = tUnknown then noExtendedStrings := tTrue;
+      if noJSONliterals = tUnknown then noJSONliterals:=tTrue;
+      if onlyJSONObjects = tUnknown then onlyJSONObjects := tFalse;
+      if noExtendedJson = tUnknown then noExtendedJson := tTrue;
+      if strictTypeChecking = tUnknown then strictTypeChecking := tTrue;
+      if strictNamespaces = tUnknown then strictNamespaces := tTrue;
+      if dotNotation = xqpdnUndefined then dotNotation := xqpdnDisallowDotNotation;
+    end;
+  end;
+end;
+
+procedure TXQueryCompatibilityOptions.configureParsers;
+begin
+  xpathparser.ParsingOptions.AllowExtendedStrings := NoExtendedStrings = tFalse;
+  xpathparser.ParsingOptions.AllowJSONLiterals := NoJSONliterals = tFalse;
+  xpathparser.ParsingOptions.AllowPropertyDotNotation:=DotNotation;
+  case JSONMode of
+    cjmDeprecated: begin
+      xpathparser.ParsingOptions.AllowJSON:=NoJSON = tfalse;
+      if (NoJSON = tfalse) and (OnlyJSONObjects = tTrue) then begin
+        xpathparser.ParsingOptions.JSONArrayMode := xqjamJSONiq;
+        xpathparser.ParsingOptions.JSONObjectMode := xqjomJSONiq;
+      end;
+      GlobalJSONParseOptions := [jpoJSONiq];
+      xpathparser.StaticContext.AllowJSONiqOperations := true;
+    end;
+    cjmStandard: begin
+      xpathparser.ParsingOptions.JSONArrayMode := xqjamStandard;
+      xpathparser.ParsingOptions.JSONObjectMode := xqjomForbidden;
+      xpathparser.ParsingOptions.AllowJSONiqTests := false;
+      xpathparser.StaticContext.AllowJSONiqOperations := false;
+    end;
+    cjmJSONiq: begin
+      xpathparser.ParsingOptions.JSONArrayMode := xqjamJSONiq;
+      xpathparser.ParsingOptions.JSONObjectMode := xqjomJSONiq;
+      xpathparser.ParsingOptions.AllowJSONiqTests := true;
+      GlobalJSONParseOptions := [jpoJSONiq];
+      xpathparser.StaticContext.AllowJSONiqOperations := true;
+    end;
+    cjmUnified: begin
+      xpathparser.ParsingOptions.JSONArrayMode := xqjamStandard;
+      xpathparser.ParsingOptions.JSONObjectMode := xqjomMapAlias;
+      xpathparser.ParsingOptions.AllowJSONiqTests := true;
+      xpathparser.StaticContext.AllowJSONiqOperations := false;
+    end;
+  end;
+  setJSONFormat(globalDefaultInputFormat);
+  xpathparser.StaticContext.jsonPXPExtensions:=NoExtendedJson = tFalse;
+  xpathparser.StaticContext.strictTypeChecking:=StrictTypeChecking = tTrue;
+  xpathparser.StaticContext.useLocalNamespaces:=StrictNamespaces = tFalse;
+  htmlparser.ignoreNamespaces := ignoreNamespace;
+end;
+
+procedure TXQueryCompatibilityOptions.configureParsers(kind: TExtractionKind);
+var mycopy: TXQueryCompatibilityOptions;
+begin
+  mycopy := self;
+  mycopy.setUnknownToDefault(kind);
+  mycopy.configureParsers();
+  case kind of
+    ekAuto: ;
+    ekPatternHTML, ekPatternXML: begin
+      if kind = ekPatternHTML then htmlparser.TemplateParser.parsingModel := pmHTML
+      else htmlparser.TemplateParser.parsingModel := pmStrict;
+      htmlparser.QueryEngine.ParsingOptions.StringEntities:=xqseIgnoreLikeXPath;
+    end;
+    ekDefault: begin
+      xpathparser.ParsingOptions.StringEntities:=xqseResolveLikeXQueryButIgnoreInvalid
+    end;
+    ekXPath2, ekXPath3_0, ekXPath3_1, ekXPath4_0, ekCSS, ekXQuery1, ekXQuery3_0, ekXQuery3_1, ekXQuery4_0: begin
+      xpathparser.ParsingOptions.StringEntities:=xqseDefault;
+    end;
+    ekMultipage: ;
+  end;
+end;
 
 constructor TFollowToXQVObject.create(const abasedata: IData; const av: IXQValue);
 begin
@@ -672,16 +799,18 @@ end;
 
 { TOptionReaderWrapper }
 
-function TOptionReaderWrapper.read(const name: string; out value: IXQValue): boolean;
+function TOptionReaderWrapper.read(const name: string; var value: IXQValue): boolean;
 begin
+  ignore(name);
+  ignore(value);
   result := false;
 end;
 
-function TOptionReaderWrapper.read(const name: string ; out inputformat: TInputFormat): boolean;
+function TOptionReaderWrapper.read(const name: string ; var inputformat: TInputFormat): boolean;
 var
-  temp: String;
+  temp: String = '';
 begin
-  result := read('input-format', temp);
+  result := read(name, temp);
   if result then
     case temp of
       'auto': inputFormat:=ifAuto;
@@ -693,6 +822,15 @@ begin
       'text': inputFormat := ifPlainText;
       else raise EXidelException.Create('Invalid input-format: '+temp);
     end;
+end;
+
+function TOptionReaderWrapper.read(const name: string; var value: trilean): boolean;
+var temp: boolean = false;
+begin
+  result := read(name, temp);
+  if not result then value := tUnknown
+  else if temp then value := tTrue
+  else value := tfalse;
 end;
 
 { TDataObject }
@@ -717,7 +855,7 @@ begin
   result := fcontenttype;
 end;
 
-function TDataObject.headers: TStringList;
+function TDataObject.headers: THTTPHeaderList;
 begin
   result := fheaders;
 end;
@@ -786,39 +924,39 @@ begin
   obj := aobj;
 end;
 
-function TOptionReaderFromObject.read(const name: string; out value: string): boolean;
+function TOptionReaderFromObject.read(const name: string; var value: string): boolean;
 var
   temp: TXQValue;
 begin
   result := obj.hasProperty(name, @temp);
-  if result then value := temp.toString;
+  if result then value := temp.toString
 end;
 
-function TOptionReaderFromObject.read(const name: string; out value: integer): boolean;
+function TOptionReaderFromObject.read(const name: string; var value: integer): boolean;
 var
   temp: TXQValue;
 begin
   result := obj.hasProperty(name, @temp);
-  if result then value := temp.toInt64;
+  if result then value := temp.toInt64
 end;
 
-function TOptionReaderFromObject.read(const name: string; out value: boolean): boolean;
+function TOptionReaderFromObject.read(const name: string; var value: boolean): boolean;
 var
   temp: TXQValue;
 begin
   result := obj.hasProperty(name, @temp);
-  if result then value := temp.toBoolean;
+  if result then value := temp.toBoolean
 end;
 
-function TOptionReaderFromObject.read(const name: string; out value: Extended): boolean;
+function TOptionReaderFromObject.read(const name: string; var value: Extended): boolean;
 var
   temp: TXQValue;
 begin
   result := obj.hasProperty(name, @temp);
-  if result then value := temp.toFloat;
+  if result then value := temp.toFloat
 end;
 
-function TOptionReaderFromObject.read(const name: string; out value: IXQValue): boolean;
+function TOptionReaderFromObject.read(const name: string; var value: IXQValue): boolean;
 var
   temp: TXQValue;
 begin
@@ -833,25 +971,25 @@ begin
   acmdLine := cmdLine;
 end;
 
-function TOptionReaderFromCommandLine.read(const name: string; out value: string): boolean;
+function TOptionReaderFromCommandLine.read(const name: string; var value: string): boolean;
 begin
   value := acmdLine.readString(name);
   result := acmdLine.existsProperty(name);
 end;
 
-function TOptionReaderFromCommandLine.read(const name: string; out value: integer): boolean;
+function TOptionReaderFromCommandLine.read(const name: string; var value: integer): boolean;
 begin
   value := acmdLine.readInt(name);
   result := acmdLine.existsProperty(name);
 end;
 
-function TOptionReaderFromCommandLine.read(const name: string; out value: boolean): boolean;
+function TOptionReaderFromCommandLine.read(const name: string; var value: boolean): boolean;
 begin
   value := acmdLine.readFlag(name);
   result := acmdLine.existsProperty(name);
 end;
 
-function TOptionReaderFromCommandLine.read(const name: string; out value: Extended): boolean;
+function TOptionReaderFromCommandLine.read(const name: string; var value: Extended): boolean;
 begin
   value := acmdLine.readFloat(name);
   result := acmdLine.existsProperty(name);
@@ -876,6 +1014,8 @@ begin
   realUrl := data.baseUri;
   if guessType(realUrl) = rtRemoteURL then realurl := decodeURL(realUrl).path;
 
+  if assigned(data.headers) and data.headers.getContentDispositionFileNameTry(realPath) then
+    realUrl := realPath;
   j := strRpos('/', realUrl);
   if j = 0 then begin
     realPath := '';
@@ -883,6 +1023,12 @@ begin
   end else begin
     realPath := copy(realUrl, 1, j);
     realFile := copy(realUrl, j + 1, length(realUrl) - j)
+  end;
+  if realPath.Contains('..') then begin
+    while strBeginsWith(realPath, '/') do delete(realPath,1,1);
+    realPath := StringReplace(realPath, '\' , '/', [rfReplaceAll]);
+    realPath := strResolveURI(realPath, 'file:///');
+    realPath := strAfter(realPath, 'file:');
   end;
   while strBeginsWith(realPath, '/') do delete(realPath,1,1);
 
@@ -911,7 +1057,8 @@ begin
     color := colorizing;
     if color in [cAlways, cAuto] then
       case data.inputFormat of
-        ifHTML, ifXML, ifXMLStrict: color := cXML;
+        ifXML, ifXMLStrict: color := cXML;
+        ifHTML: color := cHTML;
         ifJSON, ifJSONStrict: color := cJSON;
         ifAuto, ifPlainText: ;
       end;
@@ -923,7 +1070,7 @@ begin
   else if strEndsWith(downloadTo, '/') then downloadTo := downloadTo + '/' + realPath + realFile
   else if DirectoryExists(downloadTo) or (downloadTo = '.' { <- redunant check, but safety first }) then downloadTo := downloadTo + '/' + realFile;
   if strEndsWith(downloadTo, '/') or (downloadTo = '') then downloadTo += 'index.html'; //sometimes realFile is empty
-  parent.printStatus('**** Save as: '+downloadTo+' ****');
+  parent.printStatus('Save as', downloadTo, sProcessingInformation);
   if pos('/', downloadTo) > 0 then
     ForceDirectories(StringReplace(StringReplace(copy(downloadTo, 1, strRpos('/', downloadTo)-1), '//', '/', [rfReplaceAll]), '/', DirectorySeparator, [rfReplaceAll]));
   strSaveToFileUTF8(StringReplace(downloadTo, '/', DirectorySeparator, [rfReplaceAll]), data.rawdata);
@@ -968,16 +1115,15 @@ var
   i: Integer;
   d: TDataObject;
 begin
-  if not allowInternetAccess then raise EXidelException.Create('Internet access not permitted');
-  if assigned(onPrepareInternet) then  internet := onPrepareInternet(parent.userAgent, parent.proxy, @parent.httpReact);
+  parent.configureInternet;
   if (parent.loadCookies <> '') then begin
     internet.cookies.loadFromFile(parent.loadCookies);
     parent.loadCookies := ''; //only need to load them once?
   end;
   escapedURL := url;
   if not rawURL then escapedURL := TInternetAccess.urlEncodeData(url, ueXPathHTML4);
-  parent.printStatus('**** Retrieving ('+method+'): '+escapedURL+' ****');
-  if parent.printPostData and (data <> '') then parent.printStatus(data);
+  parent.printStatus('Retrieving ('+method+')', escapedURL, sProcessingInformation);
+  if parent.printPostData and (data <> '') then parent.printStatus('Data', data, sProcessingInformation);
   result := TDataObject.create('', escapedURL);
   if assigned(onRetrieve) then begin
     parent.stupidHTTPReactionHackFlag := 0;
@@ -992,16 +1138,15 @@ begin
     end;
   end;
   if parent.printReceivedHeaders and assigned(internet) then begin
-    parent.printStatus('** Headers: (status: '+inttostr(internet.lastHTTPResultCode)+')**');
+    parent.printStatus('Headers', '(HTTP code: '+inttostr(internet.lastHTTPResultCode)+')', sDefault);
     for i:=0 to internet.lastHTTPHeaders.Count-1 do
-      wln(internet.lastHTTPHeaders[i]);
+      wln(internet.lastHTTPHeaders.Strings[i]);
   end;
   if Assigned(internet) then begin
     d := (result as TDataObject);
     d.fcontenttype := internet.getLastContentType;
-    d.fheaders := TStringList.Create;
-    for i := 0 to internet.lastHTTPHeaders.count - 1 do
-      d.fheaders.Add(internet.lastHTTPHeaders[i]);
+    d.fheaders := THTTPHeaderList.Create;
+    d.fheaders.Assign(internet.lastHTTPHeaders);
   end;
   with result as TDataObject do begin
     finputFormat := self.inputFormat;
@@ -1103,8 +1248,8 @@ end;
 procedure closeMultiArgs(var oldValue: string; separator: string); forward;
 
 procedure THTTPRequest.readOptions(reader: TOptionReaderWrapper);
-var temp: string;
-  tempxq: IXQValue;
+var temp: string = '';
+  tempxq: IXQValue = nil;
   h: IXQValue;
 begin
   inherited;
@@ -1152,7 +1297,7 @@ end;
 function TFileRequest.retrieve(parent: TProcessingContext; arecursionLevel: integer): IData;
 begin
   if not allowFileAccess then raise EXidelException.Create('File access not permitted');
-  parent.printStatus('**** Retrieving: '+url+' ****');
+  parent.printStatus('Retrieving', url, sProcessingInformation);
   result := TDataObject.create(strLoadFromFileUTF8(url), url);
   with result as TDataObject do begin
     fbaseurl:=fileNameExpandToURI(fbaseurl);
@@ -1353,7 +1498,7 @@ var x: IXQValue;
 
 begin
   if dest.kind <> pvkSequence then
-    dest := xpathparser.evaluateXPath2('pxp:resolve-html(., $url)', dest);
+    dest := xpathparser.evaluateXPath('pxp:resolve-html(., $url)', dest);
   case dest.kind of
     pvkUndefined: exit;
     pvkObject: begin
@@ -1362,7 +1507,7 @@ begin
       isPureDataSource := true;
       for key in keys do
         case key of
-          'header', 'headers', 'post', 'data', 'url', 'form', 'method', 'input-format': ;
+          'header', 'headers', 'post', 'data', 'input', 'url', 'form', 'method', 'input-format': ;
           else begin
             isPureDataSource := false;
             break;
@@ -1372,7 +1517,7 @@ begin
       if isPureDataSource then begin
         if dest.hasProperty('url', @tempv) then
           addObject( tempv.toString, basedata.baseUri, dest as TXQValueMapLike, parent.followInputFormat)
-        else if dest.hasProperty('data', @tempv) then
+        else if dest.hasProperty('input', @tempv) or dest.hasProperty('data', @tempv) then
           addObject(tempv.toString, basedata.baseUri, dest as TXQValueMapLike, parent.followInputFormat );
       end else add(TFollowToXQVObject.create(basedata, dest));
     end;
@@ -1456,12 +1601,15 @@ function extractKindFromString(v: string): TExtractionKind;
 begin
   case v of
     'auto': result := ekAuto;
+    'default': result := ekDefault;
     'xpath2': result :=ekXPath2;
     'xquery1': result :=ekXQuery1;
     'xpath', 'xpath3', 'xpath3.1': result :=ekXPath3_1;
     'xquery', 'xquery3', 'xquery3.1': result :=ekXQuery3_1;
     'xpath3.0': result :=ekXPath3_0;
     'xquery3.0': result :=ekXQuery3_0;
+    'xpath4.0': result := ekXPath4_0;
+    'xquery4.0': result :=ekXQuery4_0;
     'css': result :=ekCSS;
     'template', 'pattern', 'html-pattern': result :=ekPatternHTML;
     'xml-pattern': result := ekPatternXML;
@@ -1472,7 +1620,7 @@ end;
 
 procedure TExtraction.readOptions(reader: TOptionReaderWrapper);
 var
-  tempstr: string;
+  tempstr: string='';
 begin
   if extract = '' then begin
     reader.read('extract', extract);  //todo. option: extract-file
@@ -1502,25 +1650,31 @@ begin
 
   if reader.read('print-variables', tempstr) then setVariables(tempstr);
 
-  if reader.read('printed-node-format', tempstr) then begin
+  if reader.read('output-node-format', tempstr) or reader.read('printed-node-format', tempstr)  then begin
       case tempstr of
         'text': printedNodeFormat:=tnsText;
         'xml': printedNodeFormat:=tnsXML;
         'html': printedNodeFormat:=tnsHTML;
         else raise EInvalidArgument.create('Unknown node format option: '+tempstr);
       end;
+      if reader.read('printed-node-format', tempstr) then writeln(stderr, '--printed-node-format is deprecated, use --output-node-format');
     end else if reader.read('output-format', tempstr) then
       case tempstr of
         'xml': printedNodeFormat:=tnsXML;
         'html': printedNodeFormat:=tnsHTML;
       end;
 
-  if reader.read('printed-json-format', tempstr) then begin
+  if reader.read('output-json-indent', tempstr) or reader.read('printed-json-format', tempstr) then begin
     case tempstr of
       'pretty': printedJSONFormat := jisPretty;
       'compact': printedJSONFormat := jisCompact;
     end;
+    if reader.read('printed-json-format', tempstr) then writeln(stderr, '--printed-json-format is deprecated, use --output-json-indent');
   end;
+  if reader.read('output-key-order', tempstr) then
+    printedJSONKeyOrder:=XQKeyOrderFromString(tempstr);
+
+  reader.read('output-node-indent', outputIndentXML);
 
   reader.read('input-format', inputFormat);
 
@@ -1538,23 +1692,44 @@ begin
   if arrayIndexOf(tempSplitted, 'final') >= 0 then include(printVariables, pvFinal);
 end;
 
+
 { TProcessingRequest }
 
-procedure TProcessingContext.printStatus(s: string);
+procedure TProcessingContext.configureInternet;
 begin
-  if not silent then wstderr(s);
+  if not allowInternetAccess then raise EXidelException.Create('Internet access not permitted');
+  defaultInternetConfiguration.userAgent:=userAgent;
+  defaultInternetConfiguration.setProxy(proxy);
+  defaultInternetConfiguration.tryDefaultConfig := not hasProxySettings;
+  defaultInternet.OnTransferReact := @httpReact;
+  defaultInternet.config := @defaultInternetConfiguration;
+end;
+
+var globalDataSourceCount: SizeInt = 0;
+procedure TProcessingContext.printStatus(header, status: string; statusInfo: TStatusInfo);
+begin
+  if (statusInfo = sProcessingInformation) and not (printPostData {verbose}) then begin
+    if globalDataSourceCount = 1 then exit;
+  end;
+
+  if not silent then begin
+    setTerminalColor(true, ccWhiteBold);
+    werr(header);
+    setTerminalColor(true, ccNormal);
+    werrln(': '+ status);
+  end;
 end;
 
 procedure TProcessingContext.readOptions(reader: TOptionReaderWrapper);
 var
-  tempstr: string;
-  tempbool: boolean;
+  tempstr: string = '';
+  tempbool: boolean = false;
 begin
 
   if allowInternetAccess then begin
     reader.read('wait', wait);
     reader.read('user-agent', userAgent);
-    reader.read('proxy', proxy);
+    hasProxySettings := reader.read('proxy', proxy);
     //reader.read('post', Post);
     //reader.read('method', method); moved to
     reader.read('print-received-headers', printReceivedHeaders);
@@ -1573,6 +1748,7 @@ begin
     follow := cmdLine.readString('follow');
     if follow = '-' then follow :=strReadFromStdin;
   end;} //handled in variableRead
+  follow := '';
   reader.read('follow', follow);
   if not cgimode and strBeginsWith(follow, '@') then follow := strLoadFromFileChecked(strCopyFrom(follow, 2));
   if reader.read('follow-kind', tempstr) then followKind := extractKindFromString(tempstr);
@@ -1582,49 +1758,49 @@ begin
   reader.read('input-format', followInputFormat);
 
   reader.read('json-mode', tempstr);
-  case tempstr of
-    'standard': compatibilityJSONMode:=cjmStandard;
-    'jsoniq': compatibilityJSONMode:=cjmJSONiq;
-    'deprecated': compatibilityJSONMode:=cjmDeprecated;
-    else{'standard': }compatibilityJSONMode:=cjmDefault;
-  end;
-  reader.read('no-json', compatibilityNoJSON);
-  if compatibilityNoJSON then writeln(stderr, 'no-json option is deprecated. use --json-mode');
-  if not reader.read('no-json-literals', compatibilityNoJSONliterals)  then
-    compatibilityNoJSONliterals := compatibilityJSONMode = cjmStandard;
-
-  if reader.read('dot-notation', tempstr) then begin
+  with compatibility do begin
     case tempstr of
-      'on': compatibilityDotNotation := xqpdnAllowFullDotNotation;
-      'off': compatibilityDotNotation := xqpdnDisallowDotNotation;
-      'unambiguous': compatibilityDotNotation := xqpdnAllowUnambiguousDotNotation;
+      'standard': JSONMode:=cjmStandard;
+      'jsoniq': JSONMode:=cjmJSONiq;
+      'deprecated': JSONMode:=cjmDeprecated;
+      'unified': JSONMode := cjmUnified;
+      else{'standard': }JSONMode:=cjmUndefined;
     end;
-  end else if compatibilityJSONMode in [cjmStandard,cjmJSONiq] then
-    compatibilityDotNotation := xqpdnDisallowDotNotation
-   else
-    compatibilityDotNotation := xqpdnAllowUnambiguousDotNotation;
-  if reader.read('no-dot-notation', tempbool) then begin
-    writeln(stderr, 'no-dot-notation option is deprecated. use --dot-notation');
-    if tempbool = true then
-      compatibilityDotNotation := xqpdnDisallowDotNotation;
-  end;
-  reader.read('only-json-objects', compatibilityOnlyJSONObjects);
-  if compatibilityOnlyJSONObjects then writeln(stderr, 'only-json-objects option is deprecated. use --json-mode');
-  if not reader.read('no-extended-json', compatibilityNoExtendedJson) then
-    compatibilityNoExtendedJson := compatibilityJSONMode in [cjmStandard,cjmJSONiq];
+    reader.read('no-json', NoJSON);
+    if NoJSON <> tUnknown then writeln(stderr, 'no-json option is deprecated. use --json-mode');
+    reader.read('no-json-literals', NoJSONliterals);
 
-  reader.read('strict-type-checking', compatibilityStrictTypeChecking);
-  reader.read('strict-namespaces', compatibilityStrictNamespaces);
-  reader.read('no-extended-strings', compatibilityNoExtendedStrings);
-  reader.read('ignore-namespaces', ignoreNamespace);
+    if reader.read('dot-notation', tempstr) then begin
+      case tempstr of
+        'on': DotNotation := xqpdnAllowFullDotNotation;
+        'off': DotNotation := xqpdnDisallowDotNotation;
+        'unambiguous': DotNotation := xqpdnAllowUnambiguousDotNotation;
+      end;
+    end else if JSONMode in [cjmStandard,cjmJSONiq] then
+      DotNotation := xqpdnDisallowDotNotation
+     else
+      DotNotation := xqpdnAllowUnambiguousDotNotation;
+    if reader.read('no-dot-notation', tempbool) then begin
+      writeln(stderr, 'no-dot-notation option is deprecated. use --dot-notation');
+      if tempbool = true then
+        DotNotation := xqpdnDisallowDotNotation;
+    end;
+    reader.read('only-json-objects', OnlyJSONObjects);
+    if OnlyJSONObjects <> tUnknown then writeln(stderr, 'only-json-objects option is deprecated. use --json-mode');
+    reader.read('no-extended-json', noExtendedJson);
+
+
+    reader.read('strict-type-checking', StrictTypeChecking);
+    reader.read('strict-namespaces', StrictNamespaces);
+    reader.read('no-extended-strings', NoExtendedStrings);
+    reader.read('ignore-namespaces', ignoreNamespace);
+  end;
   reader.read('no-optimizations', noOptimizations);
 
 
 //deprecated:   if (length(extractions) > 0) and (extractions[high(extractions)].extractKind = ekMultipage) and (length(urls) = 0) then
 //    arrayAdd(urls, '<empty/>');
 //  if cmdLine.readString('data') <> '' then arrayAdd(urls, cmdLine.readString('data'));
-
-
 end;
 
 
@@ -1657,7 +1833,7 @@ begin
   end;            }
   if obj.hasProperty('url', @temp) then
     readNewDataSource(TFollowTo.createFromRetrievalAddress(temp.toString), tempreader)
-  else if obj.hasProperty('data', @temp) then
+  else if obj.hasProperty('input', @temp) or obj.hasProperty('data', @temp)  then
     readNewDataSource(TFollowTo.createFromRetrievalAddress(temp.toString), tempreader);
   tempreader.free;
 end;
@@ -1667,6 +1843,7 @@ begin
   SetLength(dataSources, length(dataSources) + 1);
   dataSources[high(dataSources)] := source;
   dataSources[high(dataSources)].parent := self;
+  inc(globalDataSourceCount);
 end;
 
 procedure TProcessingContext.readNewDataSource(data: TFollowTo; options: TOptionReaderWrapper);
@@ -1696,22 +1873,14 @@ begin
   wait := other.wait;
   userAgent := other.userAgent;
   proxy := other.proxy;
+  hasProxySettings := other.hasProxySettings;
   printReceivedHeaders:=other.printReceivedHeaders;
   errorHandling:=errorHandling;
 
   silent := other.silent;
   printPostData := other.printPostData;
 
-  compatibilityNoExtendedStrings := other.compatibilityNoExtendedStrings;
-  compatibilityJSONMode:= other.compatibilityJSONMode;
-  compatibilityNoJSON := other.compatibilityNoJSON;
-  compatibilityNoJSONliterals := other.compatibilityNoJSONliterals;
-  compatibilityDotNotation := other.compatibilityDotNotation;
-  compatibilityOnlyJSONObjects := other.compatibilityOnlyJSONObjects;
-  compatibilityNoExtendedJson := other.compatibilityNoExtendedJson;
-  compatibilityStrictTypeChecking := other.compatibilityStrictTypeChecking;
-  compatibilityStrictNamespaces := other.compatibilityStrictNamespaces;
-  ignoreNamespace:=other.ignoreNamespace;
+  compatibility := other.compatibility;
   noOptimizations:=other.noOptimizations;
 
   followExclude := other.followExclude;
@@ -1757,10 +1926,11 @@ begin
   exit(self);
 end;
 
-procedure TProcessingContext.insertFictiveDatasourceIfNeeded(canUseStdin: boolean);
+procedure TProcessingContext.insertFictiveDatasourceIfNeeded(canUseStdin: boolean; options: TOptionReaderWrapper);
 var
   i: Integer;
   needDatasource: Boolean;
+  data: string;
 begin
   if Length(dataSources) > 0 then exit();
   if Length(actions) = 0 then exit();
@@ -1771,19 +1941,23 @@ begin
       break;
     end;
   if needDatasource then begin
-    readNewDataSource(TFollowTo.createFromRetrievalAddress(IfThen(canUseStdin, '-', '<empty/>')), nil)
+    if canUseStdin then data := '-'
+    else begin
+      data := '<empty/>';
+      options := nil;
+    end;
+    readNewDataSource(TFollowTo.createFromRetrievalAddress(data), options)
    end else for i := 0 to high(actions) do
     if actions[i] is TProcessingContext then
-      TProcessingContext(actions[i]).insertFictiveDatasourceIfNeeded(false);
+      TProcessingContext(actions[i]).insertFictiveDatasourceIfNeeded(false, options);
 end;
 
 const EXTRACTION_KIND_TO_PARSING_MODEL: array[TExtractionKind] of TXQParsingModel = (
-  xqpmXPath3_1,
-  xqpmXPath2, xqpmXPath3_0, xqpmXPath3_1,
-  xqpmXQuery1, xqpmXQuery3_0, xqpmXQuery3_1,
-  xqpmXPath3_1, xqpmXPath3_1, xqpmXPath3_1, xqpmXPath3_1 //filler
+  xqpmXQuery4_0, xqpmXQuery4_0,
+  xqpmXPath2, xqpmXPath3_0, xqpmXPath3_1, xqpmXPath4_0,
+  xqpmXQuery1, xqpmXQuery3_0, xqpmXQuery3_1, xqpmXQuery4_0,
+  xqpmXPath4_0, xqpmXPath4_0, xqpmXPath4_0, xqpmXPath4_0 //filler
 );
-  GlobalJSONParseOptions: TXQJsonParser.TOptions = [];
 var GlobalDebugInfo: TObjectList;
 type
   TXQueryEngineHelper = class helper for TXQueryEngine
@@ -1815,14 +1989,6 @@ type
   end;
 
 
-procedure setJSONFormat(format: TInputFormat);
-begin
-  case format of //todo: cache?
-    ifJSON: xpathparser.DefaultJSONParser.options := [jpoAllowMultipleTopLevelItems, jpoLiberal, jpoAllowTrailingComma] + GlobalJSONParseOptions;
-    ifJSONStrict: xpathparser.DefaultJSONParser.options := [] + GlobalJSONParseOptions;
-    else;
-  end;
-end;
 
 function TProcessingContext.process(data: IData): TFollowToList;
 var next, res: TFollowToList;
@@ -1856,10 +2022,10 @@ var next, res: TFollowToList;
     followKind: TExtractionKind;
   begin
     if data = nil then exit;
-    if follow <> '' then printStatus('**** Processing: '+data.displayBaseUri+' ****')
+    if follow <> '' then printStatus('Processing', data.displayBaseUri, sProcessingInformation)
     else for i := skipActions to high(actions) do
       if actions[i] is TExtraction then begin
-        printStatus('**** Processing: '+data.displayBaseUri+' ****');
+        printStatus('Processing', data.displayBaseUri, sProcessingInformation);
         break; //useless printing message if no extraction is there
       end;
 
@@ -1890,11 +2056,9 @@ var next, res: TFollowToList;
       followKind := self.followKind;
       globalDefaultInputFormat := followInputFormat;
       if followKind = ekAuto then followKind := guessExtractionKind(follow);
+      compatibility.configureParsers(followKind);
 
       if followKind in [ekPatternHTML, ekPatternXML] then begin
-        if followKind = ekPatternHTML then htmlparser.TemplateParser.parsingModel := pmHTML
-        else htmlparser.TemplateParser.parsingModel := pmStrict;
-        htmlparser.QueryEngine.ParsingOptions.StringEntities:=xqseIgnoreLikeXPath;
         htmlparser.parseTemplate(follow); //todo reuse existing parser
         htmlparser.parseHTML(data); //todo: optimize
         for i:=0 to htmlparser.variableChangeLog.count-1 do
@@ -1904,7 +2068,6 @@ var next, res: TFollowToList;
       end else begin
         //assume xpath like
         xpathparser.StaticContext. BaseUri := data.baseUri;
-        xpathparser.ParsingOptions.StringEntities:=xqseDefault;
         loadDataForQueryPreParse(data);
         if followQueryCache = nil then
           case followKind of
@@ -1924,44 +2087,7 @@ var
   curRecursionLevel: Integer;
 begin
   //init
-  xpathparser.ParsingOptions.AllowExtendedStrings:= not compatibilityNoExtendedStrings;
-  xpathparser.ParsingOptions.AllowJSONLiterals:=not compatibilityNoJSONliterals;
-  xpathparser.ParsingOptions.AllowPropertyDotNotation:=compatibilityDotNotation;
-  case compatibilityJSONMode of
-    cjmDeprecated: begin
-      xpathparser.ParsingOptions.AllowJSON:=not compatibilityNoJSON;
-      if not compatibilityNoJSON and compatibilityOnlyJSONObjects then begin
-        xpathparser.ParsingOptions.JSONArrayMode := xqjamJSONiq;
-        xpathparser.ParsingOptions.JSONObjectMode := xqjomJSONiq;
-      end;
-      GlobalJSONParseOptions := [jpoJSONiq];
-      xpathparser.StaticContext.AllowJSONiqOperations := true;
-    end;
-    cjmStandard: begin
-      xpathparser.ParsingOptions.JSONArrayMode := xqjamStandard;
-      xpathparser.ParsingOptions.JSONObjectMode := xqjomForbidden;
-      xpathparser.ParsingOptions.AllowJSONiqTests := false;
-      xpathparser.StaticContext.AllowJSONiqOperations := false;
-    end;
-    cjmJSONiq: begin
-      xpathparser.ParsingOptions.JSONArrayMode := xqjamJSONiq;
-      xpathparser.ParsingOptions.JSONObjectMode := xqjomJSONiq;
-      xpathparser.ParsingOptions.AllowJSONiqTests := true;
-      GlobalJSONParseOptions := [jpoJSONiq];
-      xpathparser.StaticContext.AllowJSONiqOperations := true;
-    end;
-    cjmDefault: begin
-      xpathparser.ParsingOptions.JSONArrayMode := xqjamStandard;
-      xpathparser.ParsingOptions.JSONObjectMode := xqjomMapAlias;
-      xpathparser.ParsingOptions.AllowJSONiqTests := true;
-      xpathparser.StaticContext.AllowJSONiqOperations := false;
-    end;
-  end;
   setJSONFormat(globalDefaultInputFormat);
-  xpathparser.StaticContext.jsonPXPExtensions:=not compatibilityNoExtendedJson;
-  xpathparser.StaticContext.strictTypeChecking:=compatibilityStrictTypeChecking;
-  xpathparser.StaticContext.useLocalNamespaces:=not compatibilityStrictNamespaces;
-  htmlparser.ignoreNamespaces := ignoreNamespace;
 
   //apply all actions to all data source
   next := TFollowToList.Create;
@@ -2109,8 +2235,7 @@ begin
   end;
 end;
 
-procedure TProcessingContext.httpReact(sender: TInternetAccess; var method: string; var url: TDecodedUrl;
-  var data: TInternetAccessDataBlock; var reaction: TInternetAccessReaction);
+procedure TProcessingContext.httpReact(sender: TInternetAccess; var transfer: TTransfer; var reaction: TInternetAccessReaction);
 begin
   stupidHTTPReactionHackFlag := 0;
   case TInternetAccess.reactFromCodeString(errorHandling, sender.lastHTTPResultCode, reaction) of
@@ -2142,6 +2267,9 @@ begin
                               [rfReplaceAll]);
 end;
 
+var globalTempSerializer: TXQSerializer;
+    globalTempSerializerBuffer: string;
+
 procedure TExtraction.printExtractedValue(value: IXQValue; invariable: boolean);
   function cmdescape(s: string): string;
   begin
@@ -2170,18 +2298,38 @@ procedure TExtraction.printExtractedValue(value: IXQValue; invariable: boolean);
     case v.kind of
       pvkNode: begin
         if (outputFormat <> ofAdhoc) and (printTypeAnnotations or (not (v.toNode.typ in [tetOpen,tetDocument]) or (printedNodeFormat = tnsText))) and not invariable then needRawWrapper(mycmdline);
-        case printedNodeFormat of
-          tnsText: result := escape(v.toString);
-          tnsXML: result := cmdescape(v.toNode.outerXML());
-          tnsHTML: result := cmdescape(v.toNode.outerHTML());
+        if printedNodeFormat = tnsText then
+          result := escape(v.toString)
+        else begin
+          if outputIndentXML then globalTempSerializer.insertWhitespace := xqsiwIndent
+          else globalTempSerializer.insertWhitespace := xqsiwNever;
+          globalTempSerializer.clear;
+          serializeNodes(v.toNode, globalTempSerializer, true, printedNodeFormat = tnsHTML, nil);
+          globalTempSerializer.final;
+          result := cmdescape(globalTempSerializerBuffer);
         end;
         if printTypeAnnotations then
-          if (printedNodeFormat = tnsText) or (v.toNode.typ = tetText) then
-            result := 'text{' + xqvalue(result).toXQuery + '}';
+          if (v.toNode.typ = tetText) then result := 'text{' + xqvalue(result).toXQuery + '}'
+          else if (printedNodeFormat = tnsText) then result := xqvalue(result).toXQuery;
+        if firstItem and (outputFormat in [ofXMLWrapped, ofRawXML, ofRawHTML]) and (v.toNode.typ = tetOpen) and (outputHeader <> '') then
+          writeLineBreakAfterDeclaration;
       end;
       pvkObject, pvkArray: begin
         if (outputFormat <> ofAdhoc) and not invariable then needRawWrapper(mycmdline);
-        result := escape(v.jsonSerialize(printedNodeFormat, (printedJSONFormat = jisPretty) or (not invariable and (printedJSONFormat <> jisCompact))));
+        globalTempSerializer.clear;
+        globalTempSerializer.nodeFormat := printedNodeFormat;
+        case printedJSONFormat of
+          jisPretty: globalTempSerializer.insertWhitespace := xqsiwIndent;
+          jisDefault:
+            if outputFormat in [ofBash, ofWindowsCmd] then globalTempSerializer.insertWhitespace := xqsiwNever {see gh#71}
+            else if invariable then globalTempSerializer.insertWhitespace := xqsiwConservative
+            else globalTempSerializer.insertWhitespace := xqsiwIndent;
+          jisCompact: globalTempSerializer.insertWhitespace := xqsiwConservative;
+        end;
+        globalTempSerializer.keyOrderExtension := printedJSONKeyOrder;
+        v.jsonSerialize(globalTempSerializer);
+        globalTempSerializer.final;
+        result := escape(globalTempSerializerBuffer);
       end;
       else if not printTypeAnnotations then begin
         if (outputFormat <> ofAdhoc) and not invariable then needRawWrapper(mycmdline);
@@ -2197,7 +2345,11 @@ procedure TExtraction.printExtractedValue(value: IXQValue; invariable: boolean);
     color := colorizing;
     if (color in [cAuto,cAlways]) and (outputFormat = ofAdhoc) then
       case value.get(1).kind of
-        pvkNode: if printedNodeFormat <> tnsText then color := cXML;
+        pvkNode: case printedNodeFormat of
+          tnsText: ;
+          tnsXML: color := cXML;
+          tnsHTML: color := cHTML;
+        end;
         pvkArray,pvkObject: color := cJSON;
         else;
       end;
@@ -2217,7 +2369,8 @@ procedure TExtraction.printExtractedValue(value: IXQValue; invariable: boolean);
     params.done;
     SetCodePage(temp, CP_UTF8, false); //unnecessary?
     case params.method of
-      xqsmXML,xqsmHTML,xqsmXHTML: wcolor(temp, cXML);
+      xqsmXML,xqsmXHTML: wcolor(temp, cXML);
+      xqsmHTML: wcolor(temp, cHTML);
       xqsmJSON: wcolor(temp, cJSON);
       else wcolor(temp, cNever);
     end;
@@ -2317,13 +2470,13 @@ var
   i: Integer;
 begin
   if pvFinal in printVariables then
-    printExtractedVariables(parser.variables, '** Current variable state: **', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
+    printExtractedVariables(parser.variables, 'Current variable state', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
 
   if pvLog in printVariables then
-    printExtractedVariables(parser.variableChangeLog, '** Current variable state: **', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
+    printExtractedVariables(parser.variableChangeLog, 'Variable log', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
 
   if pvCondensedLog in printVariables then
-    printExtractedVariables(parser.VariableChangeLogCondensed, '** Current variable state: **', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
+    printExtractedVariables(parser.VariableChangeLogCondensed, 'Assigned variable log', showDefaultVariableOverride or parser.hasRealVariableDefinitions);
 
   for i := 0 to parser.variableChangeLog.count-1 do
     if parser.variableChangeLog.getName(i) = '_follow' then begin
@@ -2381,22 +2534,18 @@ begin
     setJSONFormat(globalDefaultInputFormat);
   end;
   globalCurrentExtraction := self;
+  parent.compatibility.configureParsers(extractKind);
 
   case extractKind of
     ekPatternHTML, ekPatternXML: begin
       htmlparser.UnnamedVariableName:=defaultName;
-      htmlparser.QueryEngine.ParsingOptions.StringEntities:=xqseIgnoreLikeXPath;
-      if extractKind = ekPatternHTML then htmlparser.TemplateParser.parsingModel := pmHTML
-      else htmlparser.TemplateParser.parsingModel := pmStrict;
       htmlparser.parseTemplate(extract); //todo reuse existing parser
       htmlparser.parseHTML(data); //todo: full url is abs?
       prepareForOutput(data);
       pageProcessed(nil,htmlparser);
     end;
-    ekXPath2, ekXPath3_0, ekXPath3_1, ekCSS, ekXQuery1, ekXQuery3_0, ekXQuery3_1: begin
+    ekDefault, ekXPath2, ekXPath3_0, ekXPath3_1, ekXPath4_0, ekCSS, ekXQuery1, ekXQuery3_0, ekXQuery3_1, ekXQuery4_0: begin
       xpathparser.StaticContext.BaseUri := fileNameExpandToURI(data.baseUri);
-      xpathparser.ParsingOptions.StringEntities:=xqseDefault;
-
       parent.loadDataForQueryPreParse(data);
       if extractQueryCache = nil then begin
         if extractBaseUri <> '' then xpathparser.StaticContext.baseURI := fileNameExpandToURI(extractBaseUri);
@@ -2422,11 +2571,12 @@ begin
         htmlparser.oldVariableChangeLog.setOverride(defaultName, value);
       end;
     end;
-    ekMultipage: if assigned (onPrepareInternet) then begin
+    ekMultipage: begin
       xpathparser.ParsingOptions.StringEntities:=xqseIgnoreLikeXPath;
       multipage.onPageProcessed:=@pageProcessed;
       if parent.silent then multipage.onLog := nil else multipage.onLog := @multipage.selfLog;
-      multipage.internet := onPrepareInternet(parent.userAgent, parent.proxy, @parent.httpReact);
+      parent.configureInternet();
+      multipage.internet := internet;
       multipagetemp := TMultiPageTemplate.create();
       if extract = '' then raise Exception.Create('Multipage-action-template is empty');
       multipagetemp.loadTemplateFromString(extract, ExtractFileName(extractBaseUri), ExtractFileDir(extractBaseUri));
@@ -2456,6 +2606,8 @@ begin
   hideVariableNames := other.hideVariableNames;
   printedNodeFormat := other.printedNodeFormat;
   printedJSONFormat := other.printedJSONFormat;
+  printedJSONKeyOrder := other.printedJSONKeyOrder;
+  outputIndentXML := other.outputIndentXML;
 
   inputFormat := inputFormat;
 end;
@@ -2500,7 +2652,7 @@ var
 begin
   writeBeginGroup;
   jsonItselfAssigned := false;
-  parent.printStatus(state);
+  parent.printStatus(state, '', sDefault);
   case outputFormat of
     ofAdhoc: begin
       for i:=0 to vars.count-1 do
@@ -2511,6 +2663,7 @@ begin
          end;
     end;
     ofRawXML: begin
+      writeLineBreakAfterDeclaration;
       if vars.count > 1 then needRawWrapper(mycmdline);
       for i:=0 to vars.count-1 do
          if acceptName(vars.Names[i])  then begin
@@ -2521,13 +2674,14 @@ begin
          end;
     end;
     ofRawHTML: begin
+      writeLineBreakAfterDeclaration;
       if vars.count > 1 then needRawWrapper(mycmdline);
       for i:=0 to vars.count-1 do
          if acceptName(vars.Names[i])  then begin
            isShown := showVar(i);
-           if isShown then writeVarName('<span class="'+vars.Names[i] + '">', cXML);
+           if isShown then writeVarName('<span class="'+vars.Names[i] + '">', cHTML);
            printExtractedValue(vars.get(i), isShown );
-           if isShown then wcolor('</span>', cXML);
+           if isShown then wcolor('</span>', cHTML);
          end;
     end;
     ofJsonWrapped:
@@ -2575,6 +2729,7 @@ begin
     end;
     ofXMLWrapped: begin
       if hideVariableNames then begin
+        writeLineBreakAfterDeclaration;
         wcolor('<seq>', cXML);
         first := true;
         for i:=0 to vars.count-1 do begin
@@ -2754,11 +2909,11 @@ begin
 end;
 
 var modulePaths: TStringArray;
-function loadModuleFromAtUrl(const at, base: string): IXQuery; forward;
+function loadAndImportModuleFromAtUrl(const at, base: string): IXQuery; forward;
 
 procedure traceCall({%H-}pseudoSelf: tobject; {%H-}sender: TXQueryEngine; value, info: IXQValue);
 begin
-  if not info.isUndefined then write(stderr, info.toJoinedString() + ': ');
+  if assigned(info) and not info.isUndefined then write(stderr, info.toJoinedString() + ': ');
   writeln(stderr, value.toXQuery());
 end;
 
@@ -2849,8 +3004,10 @@ procedure TXQTracer.printLastContext;
 //  vars: TXQVariableChangeLog;
 begin
   writeln(stderr, 'Dynamic context: ');
-  if lastContext.RootElement <> nil then writeln(stderr, '  root node: ', lastContext.ParentElement.toString());
-  if lastContext.ParentElement <> nil then writeln(stderr, '  parent node: ', lastContext.ParentElement.toString());
+  if lastContext.extensionContext <> nil then begin
+    if lastContext.extensionContext^.RootElement <> nil then writeln(stderr, '  root node: ', lastContext.extensionContext^.ParentElement.toString());
+    if lastContext.extensionContext^.ParentElement <> nil then writeln(stderr, '  parent node: ', lastContext.extensionContext^.ParentElement.toString());
+  end;
   if lastContext.SeqValue <> nil then writeln(stderr, '  context item (.): ', lastContext.SeqValue.toXQuery());
   writeln(stderr, '  position()/last(): ', lastContext.SeqIndex, ' / ', lastContext.SeqLength);
   {vars := lastContext.temporaryVariables;
@@ -2890,6 +3047,7 @@ var
   tobj: Pointer;
   j: SizeInt;
   i: Integer;
+  s: string;
 begin
   case outputFormat of
     ofJsonWrapped: begin
@@ -2937,6 +3095,8 @@ begin
         sayln( 'Partial matches:');
         temp := strSplit(htmlparser.debugMatchings(50), LineEnding); //print line by line, or the output "disappears"
         for j := 0 to high(temp) do  sayln( temp[j]);
+        sayln('');
+        sayln('Hint: Xidel has performed pattern matching, searching the nodes of the query in the input document. If you are trying to run XQuery, use --xquery or surround the query with (parentheses). ')
       end;
     end;
   end;
@@ -2969,6 +3129,11 @@ begin
   if (e is EXQParsingException) and (EXQParsingException(e).next <> nil) then begin
     sayln('');
     displayError(EXQParsingException(e).next);
+  end;
+  if assigned(multipage) and (multipage.actionTrace.count > 0) then begin
+    sayln(LineEnding + 'Multipage action trace:');
+    for s in multipage.actionTrace do
+      sayln(s);
   end;
 end;
 
@@ -3014,12 +3179,15 @@ end;
 
 procedure TCommandLineReaderBreaker.setProperties(newProperties: TPropertyArray);
 begin
-  propertyArray := newProperties;
+  propertyArrayBuffer := newProperties;
+  propertyCount := length(newProperties);
 end;
 
 function TCommandLineReaderBreaker.getProperties: TPropertyArray;
 begin
-  result := propertyArray;
+  result := propertyArrayBuffer;
+  if length(result) <> propertyCount then
+    setlength(result, propertyCount)
 end;
 
 procedure TCommandLineReaderBreaker.parseUTF8(autoReset: boolean = true);
@@ -3145,14 +3313,14 @@ procedure variableRead({%H-}pseudoself: TObject; sender: TObject; const name, va
     i := pos('=', value);
     if i > 0 then prefix := strSplitGet('=', value)
     else prefix := '';
-    q := loadModuleFromAtUrl(value, xpathparser.StaticContext.baseURI);
+    q := loadAndImportModuleFromAtUrl(value, xpathparser.StaticContext.baseURI);
     if q = nil then raise Exception.Create('Failed to load module ' + value);
     namespace := (q as TXQuery).getStaticContext.moduleNamespace;
     if namespace = nil then raise Exception.Create('File ' + value + ' is not a module (it should start with "module namespace ... ;" ).');
     xpathparser.registerModule(q);
     if xpathparser.staticContext.importedModules = nil then xpathparser.staticContext.importedModules := TXQMapStringObject.Create;
     if prefix = '' then prefix := namespace.getPrefix;
-    xpathparser.staticContext.importedModules.AddObject(prefix, q as txquery);
+    xpathparser.staticContext.importedModules.AddObject(prefix, xpathparser.findModule(namespace.getURL));
   end;
 
 var
@@ -3180,6 +3348,7 @@ begin
       currentContext.followTo.assignOptions(currentContext);
       currentContext.followTo.parent := currentcontext;
       currentContext := currentContext.followTo;
+      inc(globalDataSourceCount);
     end else begin
       //sibling (later commands form a new context, unrelated to the previous one)
       currentContext.nextSibling := TProcessingContext.Create;
@@ -3219,6 +3388,8 @@ begin
     TCommandLineReaderBreaker(sender).overrideVar('form', combineMultiArgs(commandLineStackLastFormData, value, #0))
   else if name = 'header' then
     TCommandLineReaderBreaker(sender).overrideVar('header', combineMultiArgs(commandLineLastHeader, value, #13#10))
+  else if name = 'compressed' then
+    TCommandLineReaderBreaker(sender).overrideVar('header', combineMultiArgs(commandLineLastHeader, 'Accept-Encoding: gzip', #13#10))
   else if name = 'variable' then parseVariableArg
   else if name = 'xmlns' then begin
     temps:=trim(value);
@@ -3232,7 +3403,8 @@ begin
     importModule(value);
   end else if name = 'module-path' then begin
     arrayAdd(modulePaths, value);
-  end else if (name = '') or (name = 'data') then begin
+  end else if (name = '') or (name = 'data') or (name = 'input') then begin
+    if name = 'data' then writeln(stderr, '--data is deprecated. use --input');
     if (name = '') and (value = '[') then begin
       pushCommandLineState;
       currentContext := TProcessingContext.Create;
@@ -3273,12 +3445,17 @@ begin
 end;
 
 procedure printVersion;
+var
+  compiler: String;
 begin
   writeln('Xidel '+getVersionString);
   {$I xidelbuilddata.inc} //more version information to print. if you do not have the file, just create an empty one or remove this line
+  compiler := 'FPC' + {$INCLUDE %FPCVERSION%} + ' ' + {$INCLUDE %FPCTargetCPU%}+'-'+{$INCLUDE %FPCTargetOS%}+ ' ';
+  compiler += ''{$ifdef debug} + 'debug '{$endif} {$ifdef release}+'release '{$endif} {$IfOpt R+}+'R+'{$endif} {$IfOpt S+}+'S+'{$endif} {$IfOpt O+}+'O+'{$endif} {$IfOpt Q+}+'Q+'{$endif} {$IfOpt M+}+'M+'{$endif} {$IfOpt C+}+'C+'{$endif};
+  if compiler <> '' then writeln('Compiled with ', compiler );
   writeln('');
-  writeln('http://www.videlibri.de/xidel.html');
-  writeln('by Benito van der Zander <benito@benibela.de>');
+  writeln('https://www.videlibri.de/xidel.html');
+  writeln('by Benito van der Zander <benito AT benibela.de>');
   writeln();
 end;
 
@@ -3334,8 +3511,9 @@ begin
 end;
 
 var baseContext: TProcessingContext;
+    loadedModules: array of string;
 
-function loadModuleFromAtUrl(const at, base: string): IXQuery;
+function loadAndImportModuleFromAtUrl(const at, base: string): IXQuery;
 var d: IData;
   ft: TFollowTo;
   url, oldBaseUri: String;
@@ -3359,10 +3537,13 @@ begin
     if d <> nil then break;
   end;
   baseContext.silent := oldSilent;
-  if d = nil then exit(nil);
+  if (d = nil) or (d.rawData = '') then exit(nil);
+  for i := 0 to high(loadedModules) do
+    if loadedModules[i] = d.rawData then exit(nil); //do not load identical modules twice
+  SetLength(loadedModules, length(loadedModules) + 1); loadedModules[high(loadedModules)] := d.rawData;
   oldBaseUri := xpathparser.StaticContext.baseURI;
   xpathparser.StaticContext.baseURI := url;
-  result := xpathparser.parseQuery(d.rawData, xqpmXQuery3_1);
+  result := xpathparser.parseQuery(d.rawData, xqpmXQuery4_0);
   xpathparser.StaticContext.baseURI := oldBaseUri;
 
 
@@ -3378,17 +3559,11 @@ end;
 
 procedure importModule({%H-}pseudoSelf: tobject; {%H-}sender: TXQueryEngine; context: TXQStaticContext; const namespace: string; const at: array of string);
 var
-  q: IXQuery;
   i: SizeInt;
 begin
   if xpathparser.findModule(namespace) <> nil then exit;
-  for i := 0 to high(at) do begin
-    q := loadModuleFromAtUrl(at[i], context.baseURI);
-    if q <> nil then begin
-      xpathparser.registerModule(q);
-      exit
-    end;
-  end;
+  for i := 0 to high(at) do
+    loadAndImportModuleFromAtUrl(at[i], context.baseURI);
 end;
 
 procedure OnWarningDeprecated({%H-}pseudoSelf: tobject; {%H-}sender: TXQueryEngine; warning: string);
@@ -3398,7 +3573,7 @@ end;
 type TGlobalCallbackHolder = class
   procedure OnDeclareExternalVariable(const context: TXQStaticContext; sender: TObject; const namespaceUrl, variable: string; var value: IXQValue);
 end;
-var GlobalCallbackHolder: TGlobalCallbackHolder;
+var GlobalCallbackHolder: TGlobalCallbackHolder = nil;
 procedure TGlobalCallbackHolder.OnDeclareExternalVariable(const context: TXQStaticContext; sender: TObject; const namespaceUrl, variable: string; var value: IXQValue);
 var
   env: String;
@@ -3415,7 +3590,9 @@ begin
     t := TXQTermDefineVariable(sender).getSequenceType;
     if (t <> nil) then begin
       temp := context.sender.getEvaluationContext(context);
-      if not t.instanceOf(envvalue, temp) then exit;
+      if not t.instanceOf(envvalue, temp) then
+        if not t.castableAs(envvalue, context) then exit
+        else envvalue := t.castAs(envvalue, temp);
     end;
     value := envvalue;
   end;
@@ -3442,6 +3619,9 @@ begin
   registerModuleUCAICU;
   {$ifdef windows}systemEncodingIsUTF8:=getACP = CP_UTF8;{$endif}
 
+  globalTempSerializer.init(@globalTempSerializerBuffer);
+  {$ifdef windows}globalTempSerializer.lineEnding := xleCRLF;{$endif}
+
   //TXQueryEngine.dumpFunctions;
 
   htmlparser:=THtmlTemplateParserBreaker.create;
@@ -3451,7 +3631,8 @@ begin
   mycmdline.onOptionRead:=TOptionReadEvent(procedureToMethod(TProcedure(@variableRead)));
   mycmdline.allowOverrides:=true;
 
-  mycmdLine.declareString('data', 'Data/URL/File/Stdin(-) to process (--data= prefix can be omitted)');
+  mycmdLine.declareString('input', 'Data/URL/File/Stdin(-) to process (--input= prefix can be omitted)');
+  mycmdLine.declareString('data', 'Deprecated option for --input');
   mycmdLine.declareString('download', 'Downloads/saves the data to a given filename (- prints to stdout, . uses the filename of the url)');
 
   mycmdLine.beginDeclarationCategory('Extraction options:');
@@ -3503,7 +3684,7 @@ begin
 
     mycmdLine.declareFloat('wait', 'Wait a certain count of seconds between requests');
     mycmdLine.declareString('user-agent', 'Useragent used in http request', defaultUserAgent);
-    mycmdLine.declareString('proxy', 'Proxy used for http/s requests');
+    mycmdLine.declareString('proxy', 'Proxy used for requests. (prepend socks= for SOCKS proxy)');
     mycmdLine.declareString('post', joined(['Post request to send (url encoded). Multiple close occurrences are joined. If the new argument starts with &, it will always be joined. If it is empty, it will clear the previous parameters. ']));
     mycmdline.addAbbreviation('d');
     mycmdLine.declareString('form', 'Post request to send (multipart encoded). See --usage. Can be used multiple times like --post.');
@@ -3514,6 +3695,7 @@ begin
     mycmdLine.declareString('save-cookies', 'Save cookies to file');
     mycmdLine.declareFlag('print-received-headers', 'Print the received headers');
     mycmdLine.declareString('error-handling', 'How to handle http errors, e.g. 1xx=retry,200=accept,3xx=redirect,4xx=abort,5xx=skip');
+    mycmdLine.declareFlag('compressed', 'Add header Accept-Encoding: gzip');
     mycmdLine.declareFlag('raw-url', 'Do not escape the url (preliminary)');
 
     mycmdLine.beginDeclarationCategory('HTTPS connection options:');
@@ -3532,14 +3714,19 @@ begin
   mycmdLine.declareFlag('hide-variable-names','Do not print the name of variables defined in an extract template');
   mycmdLine.declareString('variable','Declares a variable (value taken from environment if not given explicitely) (multiple variables are preliminary)');
   mycmdLine.declareString('xmlns','Declares a namespace');
-  mycmdLine.declareString('printed-node-format', 'Format of an extracted node: text, html or xml');
-  mycmdline.declareString('printed-json-format', 'Format of JSON items: pretty or compact');
+  mycmdLine.declareString('output-node-format', 'Format of an extracted node: text, html or xml');
+  mycmdLine.declareString('printed-node-format', 'deprecated');
+  mycmdline.declareString('output-json-indent', 'Format of JSON items: pretty or compact');
+  mycmdline.declareString('printed-json-format', 'deprecated');
+  mycmdline.declareFlag('output-node-indent', 'Pretty  print XML or HTML');
   mycmdLine.declareString('output-format', 'Output format: adhoc (simple human readable), xml, html, xml-wrapped (machine readable version of adhoc), json-wrapped, bash (export vars to bash), or cmd (export vars to cmd.exe) ', 'adhoc');
-  mycmdLine.declareString('output-encoding', 'Character encoding of the output. utf-8, latin1, utf-16be, utf-16le, oem (windows console) or input (no encoding conversion)', 'utf-8');
+  mycmdLine.declareString('output-encoding', 'Character encoding of the output. utf-8, latin1, utf-16be, utf-16le, oem (windows console) or input (no encoding conversion)' {$ifdef windows}+' (default: utf-8 for files, oem for console)', ''{$else},'utf-8'{$endif});
   mycmdLine.declareString('output-declaration', 'Header for the output. (e.g. <!DOCTYPE html>, default depends on output-format)', '');
   mycmdLine.declareString('output-separator', 'Separator between multiple items (default: line break)', LineEnding);
   mycmdLine.declareString('output-header', '2nd header for the output. (e.g. <html>)', '');
   mycmdLine.declareString('output-footer', 'Footer for the output. (e.g. </html>)', '');
+  mycmdLine.declareString('output-key-order', 'Order of JSON keys', 'insertion');
+  mycmdline.addEnumerationValues(['insertion', 'ascending', 'descending']);
   mycmdLine.declareString('color', 'Coloring option (never,always,json,xml)', ifthen(cgimode, 'never', 'auto'));
 
   mycmdLine.declareString('stdin-encoding', 'Character encoding of stdin', 'utf-8');
@@ -3559,7 +3746,7 @@ begin
 
   mycmdLine.beginDeclarationCategory('XPath/XQuery compatibility options:');
 
-  mycmdline.declareString('json-mode', 'JSON mode: Possible values: standard, jsoniq, default, deprecated');
+  mycmdline.declareString('json-mode', 'JSON mode: Possible values: standard, jsoniq, unified, deprecated');
   mycmdline.declareFlag('no-json', 'Disables the JSONiq syntax extensions (like [1,2,3] and {"a": 1, "b": 2})');
   mycmdline.declareFlag('no-json-literals', 'Disables the json true/false/null literals');
   mycmdline.declareString('dot-notation', 'Specifies if the dot operator $object.property can be used. Possible values: off, on, unambiguous (default, does not allow $obj.prop, but ($obj).prop ) ', 'unambiguous');
@@ -3630,11 +3817,14 @@ begin
     SetLength(currentContext.actions, length(currentContext.actions));
     for i := 0 to high(currentContext.actions) do
       currentContext.actions[i] := currentContext.actions[i].clone(currentContext);
+    writeln(stderr, '!!! Recursive follow is deprecated and might be removed soon. !!!');
   end;
 
   if (currentContext.parent = nil) and (baseContext.nextSibling = currentContext) and (length(baseContext.dataSources) = 0) and (length(currentContext.actions) = 0) and (currentContext.follow = '') then begin
     //wrap command lines exactly like -e query data1 data2... to data1 data2... -e query, (for e.g. xargs)
     currentContext.actions := baseContext.actions;
+    for i := 0 to high(currentContext.actions) do
+      currentContext.actions[i].parent := currentContext;
     if (length(currentContext.actions) <> 0) and not (currentContext.actions[high(currentContext.actions)] is TProcessingContext) then
       currentContext.actions[high(currentContext.actions)].readOptions(cmdlineWrapper); //last options wrap back, unless in [ ]
     SetLength(baseContext.actions,0);
@@ -3652,8 +3842,7 @@ begin
     if (length(baseContext.actions) = 0) and (baseContext.follow = '') and not mycmdline.readFlag('version') then begin
       if (ParamCount = 1) and FileExists(paramstr(1)) then begin
         SetLength(baseContext.dataSources, 0);
-        SetLength(baseContext.actions, 1);
-        baseContext.actions[0] := TExtraction.create;
+        baseContext.addNewAction(TExtraction.create);
         TExtraction(baseContext.actions[0]).extract := strLoadFromFileChecked(ParamStr(1));
         TExtraction(baseContext.actions[0]).extractBaseUri := ParamStr(1);
         baseContext.silent := true;
@@ -3674,8 +3863,8 @@ begin
 
 
 
-  if allowInternetAccess and assigned(onPrepareInternet) then begin
-    onPrepareInternet(baseContext.userAgent, baseContext.proxy, @baseContext.httpReact);
+  if allowInternetAccess then begin
+    baseContext.configureInternet;
     defaultInternetConfiguration.checkSSLCertificates := not mycmdLine.readFlag('no-check-certificate');
     defaultInternetConfiguration.CAFile := mycmdLine.readString('ca-certificate');
     if defaultInternetConfiguration.CAFile = '' then begin
@@ -3685,12 +3874,12 @@ begin
     defaultInternetConfiguration.CAPath := mycmdLine.readString('ca-directory');
   end;
 
-  cmdlineWrapper.Free;
-
 
   initOutput(mycmdline);
 
-  baseContext.insertFictiveDatasourceIfNeeded(not isStdinTTY); //this allows data less evaluations, like xidel -e 1+2+3
+  baseContext.insertFictiveDatasourceIfNeeded(not isStdinTTY, cmdlineWrapper); //this allows data less evaluations, like xidel -e 1+2+3
+
+  cmdlineWrapper.Free;
 
   if mycmdline.readFlag('debug-arguments') then
     debugPrintContext(baseContext);
@@ -3723,7 +3912,7 @@ begin
     globalDuplicationList := TFollowToList.Create;
   try
     baseContext.process(nil).free;
-    baseContext.Free;
+    {$ifdef FREE_ALL_MEMORY_ON_EXIT}baseContext.Free;{$endif}
   except
     on e: ETreeParseException do begin
       displayError(e);
@@ -3763,11 +3952,6 @@ begin
     end;
   end;
 //  DumpHeap(false);
-  if allowInternetAccess then multipage.Free
-  else htmlparser.free;
-  globalDuplicationList.Free;
-  GlobalDebugInfo.Free;
-  alternativeXMLParser.Free;
 
   case outputFormat of
     {ofJsonWrapped:  wln(']');
@@ -3784,8 +3968,17 @@ begin
 
   endOutput(mycmdline);
 
+  {$ifdef FREE_ALL_MEMORY_ON_EXIT}
+  if allowInternetAccess then multipage.Free
+  else htmlparser.free;
+  globalDuplicationList.Free;
+  GlobalDebugInfo.Free;
+  alternativeXMLParser.Free;
   mycmdLine.free;
   tracer.free;
+  {$else}
+  createMemoryLeakOnExit := true;
+  {$endif}
 end;
 
 
@@ -3797,14 +3990,80 @@ var
   builder: TStrBuilder;
   Buffer:  array[1..BUF_SIZE] of byte;
   count, totalcount: LongInt;
+  inputData, tempXQV: TXQValue;
+  inputEncoding: TSystemCodePage = CP_UTF8;
+  outputEncoding: TSystemCodePage = CP_UTF8;
+
+  procedure initCommandLine;
+  var cmd: string;
+      shell: string = '';
+      shellArg: TStringArray = nil;
+      tempXQV: TXQValue;
+      s: String;
+  begin
+    cmd := args[0].toString;
+    {$ifdef unix}
+    shell := '/bin/sh';
+    SetLength(shellArg, 1);
+    shellArg[0] := '-c';
+    {$endif}
+    {$ifdef windows}
+    shell := GetEnvironmentVariableUTF8('COMSPEC');
+    if shell = '' then shell := 'CMD';
+    SetLength(shellArg, 1);
+    shellArg[0] := '/C';
+    {$endif}
+    if argc >= 2 then begin
+      if args[1].hasProperty('shell', @tempXQV) then if tempxqv.getSequenceCount = 1 then shell := tempxqv.toString;
+      if args[1].hasProperty('shell-args', @tempXQV) then shellArg := tempxqv.toStringArray;
+    end;
+    if shell = '' then proc.CommandLine := args[0].toString
+    else begin
+      {$ifdef unix}
+      proc.Executable:=shell;
+      for s in shellArg do proc.Parameters.Add(s);
+      proc.Parameters.Add(cmd);
+      {$else}
+      proc.CommandLine := shell + ' ' + strJoin(shellArg, ' ') + ' ' + cmd;
+      {$endif}
+    end;
+
+  end;
+
+  procedure writeInputPipe;
+  var view: TPCharView;
+      tempstr: string;
+  begin
+    case inputData.kind of
+      pvkString: begin
+        tempstr := inputdata.toString;
+        if inputEncoding <> CP_UTF8 then tempstr := strConvert(tempstr, CP_UTF8, inputEncoding);
+        view := tempstr.pcharView();
+      end;
+      pvkBinary: view := inputdata.toBinaryBytes.pcharView();
+      else raise EXQEvaluationException.create('pxp:system', 'Invalid value for stdin');
+    end;
+    proc.Input.Write(view.data^, view.length);
+
+  end;
 
   procedure readPipes;
+    procedure convertStdoutEncoding;
+    var temp: widestring = '';
+        temp2: RawByteString = '';
+    begin
+      widestringmanager.Ansi2WideMoveProc(@buffer[1], outputEncoding, temp, count);
+      widestringmanager.Wide2AnsiMoveProc(@temp[1], temp2, CP_UTF8, length(temp));
+      builder.append(temp2);
+    end;
+
   begin
     count := min(proc.Output.NumBytesAvailable, BUF_SIZE);
     totalcount := count;
     if count > 0 then begin
       count := proc.Output.Read(buffer{%H-}, count);
-      builder.append(@buffer[1], count);
+      if outputEncoding = CP_UTF8 then builder.append(@buffer[1], count)
+      else convertStdoutEncoding;
     end;
     if proc.Stderr <> nil then begin
       count := min(proc.Stderr.NumBytesAvailable, BUF_SIZE);
@@ -3816,15 +4075,22 @@ var
     end;
   end;
 
+
 begin
   if cgimode or not allowFileAccess then exit(xqvalue('Are you trying to hack an OSS project? Shame on you!'));
-  requiredArgCount(argc, 1);
+  requiredArgCount(argc, 1, 2);
   proc := TProcess.Create(nil);
-  proc.CommandLine := args[0].toString;
+  initCommandLine();
   builder.init(@temps);
   try
     proc.Options := proc.Options + [poUsePipes] - [poWaitOnExit];
     proc.Execute;
+    if (argc = 2) then begin
+      if args[1].hasProperty('stdout-encoding', @tempXQV) then outputEncoding := strEncodingFromName(tempXQV.toString);
+      if args[1].hasProperty('stdin-encoding', @tempXQV) then inputEncoding := strEncodingFromName(tempXQV.toString);
+      if args[1].hasProperty('stdin', @inputData) then writeInputPipe;
+    end;
+    proc.CloseInput;
     while proc.Running do begin
       readPipes;
       if totalcount = 0 then sleep(100);
@@ -3888,7 +4154,7 @@ begin
         obj := TXQValueStringMap.create();
         obj.setMutable('url', data.baseUri);
         obj.setMutable('type', data.contenttype);
-        obj.setMutable('headers', xqvalue(data.headers));
+        if data.headers <> nil then obj.setMutable('headers', xqvalue(data.headers));
         obj.setMutable('raw', xqvalue(data.rawData));
         case data.inputFormat of
           ifJSON,ifJSONStrict: obj.setMutable('json', parseJSON(data));
@@ -3901,11 +4167,9 @@ begin
     end;
 
   finally
-    defaultInternetConfiguration := oldInternetConfig;
     if assigned(internetaccess.defaultInternet) then begin
-      if assigned(internetaccess.defaultInternet.internetConfig) then
-        internetaccess.defaultInternet.internetConfig^ := oldInternetConfig; //this is not necessary??
-      internetaccess.defaultInternet.OnTransferReact := oldReact; //this is. otherwise it points to fakeContext and the next download might crash
+      internetaccess.defaultInternet.config := @oldInternetConfig;
+      internetaccess.defaultInternet.OnTransferReact := oldReact;
     end;
 
 
@@ -3942,8 +4206,8 @@ var cur, bdbase: bigdecimal;
   i: SizeInt;
 begin
   bdbase := base;
-  setZero(result);
-  setOne(cur);
+  result.setZero();
+  cur.setOne();
   for i := length(n) downto 1 do begin
     c := n[i];
     case c of
@@ -3956,7 +4220,7 @@ begin
     result := result + offset * cur;
     cur := cur * bdbase;
   end;
-  if not isZero(result) then result.signed := negative;
+  if not result.isZero() then result.signed := negative;
 end;
 
 function xqfInteger(argc: SizeInt; args: PIXQValue): IXQValue;
@@ -4002,7 +4266,7 @@ begin
   negative := bd.signed;
   bd.signed:=false;
   result := '';
-  while not isZero(bd) do begin
+  while not bd.isZero() do begin
     quotient.digits := nil;
     divideModNoAlias(quotient, remainder, bd, bdbase, 0, [bddfFillIntegerPart, bddfNoFractionalPart]);
     temp := BigDecimalToLongint(remainder);
@@ -4117,7 +4381,7 @@ begin
   fn.findComplexFunction('doc-available', 1).func:=@xqFunctionBlocked;
   for i := 1 to 2 do begin
     fn.findComplexFunction('unparsed-text', i).func:=@xqFunctionBlocked;
-    fn.findInterpretedFunction('unparsed-text-lines', i).source:='"not available in cgi mode"';
+    fn.findInterpretedFunction('unparsed-text-lines', i).sourceImplementation:='"not available in cgi mode"';
     fn.findComplexFunction('unparsed-text-available', i).func:=@xqFunctionBlocked;
   end;
   fn.findBasicFunction('environment-variable', 1).func:=@xqFunctionBlockedSimple;
@@ -4140,7 +4404,7 @@ initialization
 
   with globalTypes do begin
     pxp := TXQueryEngine.findNativeModule(XMLNamespaceUrl_MyExtensionsNew).parents[0];
-    pxp.registerBasicFunction('system', @xqfSystem, [stringt, stringt]);
+    pxp.registerFunction('system', @xqfSystem).setVersionsShared([stringt, stringt], [stringt, map, stringt]);
     pxp.registerBasicFunction('read', @xqfRead, [untypedAtomic]);
     pxpx := TXQueryEngine.findNativeModule(XMLNamespaceURL_MyExtensionsNew);
     pxpx.registerFunction('request', @xqfRequest, [xqcdContextOther]).setVersionsShared([itemStar, mapStar]);
